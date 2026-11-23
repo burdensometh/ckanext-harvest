@@ -29,6 +29,11 @@ def harvest_source_dictize(source, context, last_job_status=False):
 def harvest_job_dictize(job, context):
     out = job.as_dict()
 
+    # The config version pinned to this job (None for jobs created before
+    # config versioning existed, which use the live source configuration)
+    out['config_version'] = harvest_config_version_dictize(
+        job.config_version, context)
+
     model = context['model']
 
     if context.get('return_stats', True):
@@ -79,6 +84,12 @@ def harvest_job_dictize(job, context):
         out['gather_error_summary'] = harvest_error_dictize(q.all(), context)
 
     return out
+
+
+def harvest_config_version_dictize(config_version, context):
+    if config_version is None:
+        return None
+    return config_version.as_dict()
 
 
 def harvest_object_dictize(obj, context):

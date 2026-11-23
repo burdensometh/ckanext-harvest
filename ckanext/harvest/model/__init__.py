@@ -6,6 +6,7 @@ from sqlalchemy import Column
 from sqlalchemy import ForeignKey
 from sqlalchemy import types
 from sqlalchemy import Index
+from sqlalchemy import UniqueConstraint
 from sqlalchemy.orm import backref, relationship
 from sqlalchemy.exc import InvalidRequestError
 
@@ -106,6 +107,106 @@ class HarvestSource(BaseModel, HarvestDomainObject):
         return query.all()
 
 
+class HarvestConfigVersion(BaseModel, HarvestDomainObject):
+    """A versioned snapshot of a harvest source's configuration.
+
+    Each harvest job pins the config version that was confirmed when the
+    job was created, so that all objects gathered in the same job are
+    processed with the same configuration, even if the source is edited
+    (e.g. its default owner org or field rules) while the job is still
+    queued.
+
+    The snapshot currently covers:
+
+    * ``config``: the source configuration (JSON string), as stored in
+      ``harvest_source.config``
+    * ``owner_org``: the default owner organisation of the source dataset
+      at the time the version was confirmed
+
+    Versions are deduplicated: as long as the source configuration does
+    not change, new jobs keep pointing to the same version row.
+    """
+
+    __tablename__ = "harvest_config_version"
+
+    id = Column(types.UnicodeText, primary_key=True, default=make_uuid)
+    source_id = Column(
+        types.UnicodeText,
+        ForeignKey("harvest_source.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    version = Column(types.Integer, nullable=False)
+    config = Column(types.UnicodeText, default="")
+    owner_org = Column(types.UnicodeText, nullable=True)
+    created = Column(types.DateTime, default=datetime.datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "source_id", "version", name="harvest_config_version_source_version_key"
+        ),
+        Index("harvest_config_version_source_id_idx", "source_id"),
+    )
+
+    source = relationship(
+        "HarvestSource",
+        lazy="select",
+        backref="config_versions",
+    )
+
+    jobs = relationship(
+        "HarvestJob",
+        lazy="select",
+        back_populates="config_version",
+    )
+
+    def __repr__(self):
+        return "<HarvestConfigVersion id=%s source_id=%s version=%s>" % (
+            self.id,
+            self.source_id,
+            self.version,
+        )
+
+    @classmethod
+    def get_or_create_for_source(cls, source):
+        """Returns the config version matching the source's current state.
+
+        If the latest recorded version for the source already matches its
+        current configuration (config string and owner org), it is
+        returned unchanged. Otherwise a new version is created and saved,
+        so that the confirmed configuration stays traceable.
+        """
+        config = source.config or ""
+        package = Package.get(source.id)
+        owner_org = package.owner_org if package else None
+
+        latest = (
+            Session.query(cls)
+            .filter(cls.source_id == source.id)
+            .order_by(cls.version.desc())
+            .first()
+        )
+
+        if (
+            latest is not None
+            and (latest.config or "") == config
+            and (latest.owner_org or None) == (owner_org or None)
+        ):
+            return latest
+
+        version = latest.version + 1 if latest is not None else 1
+        config_version = cls(
+            source_id=source.id,
+            version=version,
+            config=config,
+            owner_org=owner_org,
+        )
+        config_version.save()
+        log.info(
+            "Confirmed config version %s for harvest source %s", version, source.id
+        )
+        return config_version
+
+
 class HarvestJob(BaseModel, HarvestDomainObject):
     """A Harvesting Job is performed in two phases. In first place, the
     **gather** stage collects all the Ids and URLs that need to be fetched
@@ -128,11 +229,67 @@ class HarvestJob(BaseModel, HarvestDomainObject):
     source_id = Column(types.UnicodeText, ForeignKey("harvest_source.id"))
     # status: New, Running, Finished
     status = Column(types.UnicodeText, default="New", nullable=False)
+    # The config version confirmed when the job was created. NULL for jobs
+    # created before config versioning existed (they fall back to the live
+    # source configuration).
+    config_version_id = Column(
+        types.UnicodeText,
+        ForeignKey("harvest_config_version.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     source = relationship(
         "HarvestSource",
         lazy="select",
         back_populates="jobs",
     )
+    config_version = relationship(
+        "HarvestConfigVersion",
+        lazy="select",
+        back_populates="jobs",
+    )
+
+    # Transient, in-memory only override used by replay-style actions (e.g.
+    # ``harvest_objects_import`` with ``config_version='current'``) to process
+    # this job with a different config version than the pinned one. It is
+    # never persisted to the database.
+    _config_version_override = None
+
+    def get_config_version(self):
+        """Returns the config version this job is being processed with.
+
+        This is normally the version pinned when the job was created, but
+        replay actions may set a transient override. Returns None for jobs
+        created before config versioning existed.
+        """
+        if self._config_version_override is not None:
+            return self._config_version_override
+        return self.config_version
+
+    def get_config(self):
+        """Returns the source configuration (JSON string) for this job.
+
+        Uses the pinned config version if there is one, and falls back to
+        the live source configuration otherwise.
+        """
+        config_version = self.get_config_version()
+        if config_version is not None:
+            return config_version.config
+        if self.source is not None:
+            return self.source.config
+        return None
+
+    def get_owner_org(self):
+        """Returns the default owner org to assign harvested datasets to.
+
+        Uses the owner org confirmed in the pinned config version if there
+        is one, and falls back to the source dataset's live owner org
+        otherwise.
+        """
+        config_version = self.get_config_version()
+        if config_version is not None:
+            return config_version.owner_org
+        package = Package.get(self.source_id)
+        return package.owner_org if package else None
 
     def get_last_finished_object(self):
         """Determine the last finished object in this job

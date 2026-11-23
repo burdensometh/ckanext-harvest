@@ -85,6 +85,57 @@ class TestCkanHarvester(object):
         dataset = model.Package.get(harvest_object.package_id)
         assert dataset.name == mock_ckan.DATASETS[0]['name']
 
+    def test_import_uses_config_pinned_to_job(self):
+        # A job is created with the source config confirmed at that moment
+        source = HarvestSourceObj(
+            url='http://localhost:%s/' % mock_ckan.PORT,
+            config=json.dumps({'default_tags': [{'name': 'pinned-tag'}]}))
+        job = HarvestJobObj(source=source)
+        harvest_object = HarvestObjectObj(
+            guid=mock_ckan.DATASETS[0]['id'],
+            content=json.dumps(mock_ckan.DATASETS[0]),
+            job=job)
+
+        # The admin changes the source config while the object is queued
+        call_action('harvest_source_patch', id=source.id,
+                    config=json.dumps({'default_tags': [{'name': 'live-tag'}]}))
+
+        # The import still uses the config pinned to the job
+        harvester = CKANHarvester()
+        result = harvester.import_stage(harvest_object)
+
+        assert harvest_object.errors == []
+        assert result is True
+        dataset = call_action('package_show', id=harvest_object.package_id)
+        tag_names = [tag['name'] for tag in dataset['tags']]
+        assert 'pinned-tag' in tag_names
+        assert 'live-tag' not in tag_names
+
+    def test_import_uses_owner_org_pinned_to_job(self):
+        org1 = Organization()
+        org2 = Organization()
+        source = HarvestSourceObj(
+            url='http://localhost:%s/' % mock_ckan.PORT,
+            owner_org=org1['id'])
+        job = HarvestJobObj(source=source)
+        harvest_object = HarvestObjectObj(
+            guid=mock_ckan.DATASETS[0]['id'],
+            content=json.dumps(mock_ckan.DATASETS[0]),
+            job=job)
+
+        # The admin changes the default owner org while the object is queued
+        call_action('harvest_source_patch', id=source.id,
+                    owner_org=org2['id'])
+
+        # The import still assigns the owner org pinned to the job
+        harvester = CKANHarvester()
+        result = harvester.import_stage(harvest_object)
+
+        assert harvest_object.errors == []
+        assert result is True
+        dataset = call_action('package_show', id=harvest_object.package_id)
+        assert dataset['owner_org'] == org1['id']
+
     def test_harvest(self):
         results_by_guid = run_harvest(
             url='http://localhost:%s/' % mock_ckan.PORT,

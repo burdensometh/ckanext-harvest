@@ -42,14 +42,23 @@ def _print_harvest_jobs(jobs, output):
 
 
 def _print_harvest_job(job, output):
+    config_version = job.get("config_version") or {}
+    if config_version:
+        config_version_label = "v{0} (confirmed {1})".format(
+            config_version.get("version"), config_version.get("created")
+        )
+    else:
+        config_version_label = "not pinned (live source config)"
     print(
         ("\tJob id: {}\n"
          "\t\tstatus: {}\n"
          "\t\tsource: {}\n"
+         "\t\tconfig_version: {}\n"
          "\t\tobjects: {}").format(
              job.get("id"),
              job.get("status"),
              job.get("source_id"),
+             config_version_label,
              len(job.get("objects", [])),
          ),
         file=output,
@@ -412,6 +421,7 @@ def import_stage(
     guid,
     package_id,
     segments,
+    config_version="original",
 ):
 
     if source_id_or_name:
@@ -442,10 +452,12 @@ def import_stage(
             "harvest_object_id": harvest_object_id,
             "package_id": package_id,
             "guid": guid,
+            "config_version": config_version,
         },
     )
 
     print("{0} objects reimported".format(objs_count))
+    print("Source configuration used: {0}".format(config_version))
 
 
 def job_all():

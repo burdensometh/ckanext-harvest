@@ -2,6 +2,20 @@
 
 ## [Unreleased](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...HEAD)
 
+* Pin the source configuration to each harvest job: when a job is created, the
+  source config and default owner org confirmed at that moment are stored as a
+  traceable `harvest_config_version` record, and all objects of the job are
+  processed with it, even if the source is edited while the job is queued.
+  Requires a database migration (`ckan db upgrade -p harvest`).
+* `harvest_objects_import` (and `ckan harvester import`) accepts a
+  `config_version` parameter (`original`/`current`) to choose whether replayed
+  objects are processed with the config version pinned to their job or with the
+  source's current configuration.
+* The config version used by a job is shown in `harvest_job_show`,
+  `harvest_job_report`, the job report page and the notification emails, and
+  the version history of a source is available via the new
+  `harvest_config_version_list` action.
+
 ## [v1.6.3](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...v1.6.3) - 2026-08-12
 
 * The extension can now be installed via `pip install ckanext-harvest`: included requirements in pyproject.toml. To use the RabbitMQ backend, use `pip install ckanext-harvest[amqp]`.

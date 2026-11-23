@@ -9,7 +9,7 @@ from ckanext.harvest.utils import (
     DATASET_TYPE_NAME
 )
 from ckanext.harvest.model import (HarvestSource, HarvestJob, HarvestObject,
-                                   HarvestObjectExtra)
+                                   HarvestObjectExtra, HarvestConfigVersion)
 from ckanext.harvest.logic.dictization import (harvest_job_dictize,
                                                harvest_object_dictize)
 from ckanext.harvest.logic.schema import harvest_object_create_schema
@@ -112,6 +112,10 @@ def harvest_job_create(context, data_dict):
 
     job = HarvestJob()
     job.source = source
+    # Pin the source configuration confirmed at creation time, so that all
+    # objects gathered in this job are processed with the same
+    # configuration, even if the source is edited while the job is queued.
+    job.config_version = HarvestConfigVersion.get_or_create_for_source(source)
     job.save()
     log.info('Harvest job saved %s', job.id)
 

@@ -76,4 +76,24 @@ Example:
     <th>{{ _('Status') }}</th>
     <td>{{ _(job.status) }}</td>
   </tr>
+  <tr>
+    <th>{{ _('Config version') }}</th>
+    <td>
+      {% if job.config_version %}
+        v{{ job.config_version.version }}
+        ({{ _('confirmed') }}
+        <span class="automatic-local-datetime" data-datetime="{{ h.render_datetime(job.config_version.created, date_format='%Y-%m-%dT%H:%M:%S%z') }}">
+          {{ h.render_datetime(job.config_version.created, with_hours=True) }}
+        </span>)
+        {% if job.config_version.owner_org %}
+          <br>{{ _('Owner org') }}: {{ job.config_version.owner_org }}
+        {% endif %}
+        {% if job.config_version.config %}
+          <br><code>{{ job.config_version.config }}</code>
+        {% endif %}
+      {% else %}
+        {{ _('Not pinned - this job uses the live source configuration') }}
+      {% endif %}
+    </td>
+  </tr>
 </table>

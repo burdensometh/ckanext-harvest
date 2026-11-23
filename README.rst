@@ -277,6 +277,36 @@ The commands should be run with the pyenv activated and refer to your CKAN confi
 
 **Note that on CKAN >= 2.9 all commands with an underscore in their name changed.** They now use a hyphen instead of an underscore (e.g. ``gather_consumer`` changed to ``gather-consumer``).
 
+Source configuration versions
+=============================
+
+When a harvest job is created, the source configuration confirmed at that
+moment (the JSON config, including e.g. the default tags/groups/extras field
+rules, and the default owner organization) is stored as a *config version*
+and pinned to the job. All objects gathered in the same job are processed
+with that pinned configuration, even if the source is edited while the job
+is still queued (e.g. jobs that are gathered during the day but only
+imported overnight). Each version is kept in the database, so it is always
+possible to tell which configuration a particular job was processed with.
+Jobs created before this feature existed keep using the live source
+configuration.
+
+The config version used by a job is shown on the job report page and
+included in the output of the ``harvest_job_show`` and ``harvest_job_report``
+API actions and in the notification emails. The full version history of a
+source is available via the ``harvest_config_version_list`` API action.
+
+When reimporting already fetched objects, you can choose which configuration
+to process them with. By default the config version pinned to each object's
+job is used; pass ``--config-version current`` to use the source's current
+configuration instead (which is confirmed and stored as a new config
+version)::
+
+    ckan --config=/etc/ckan/default/ckan.ini harvester import SOURCE_ID_OR_NAME --config-version current
+
+The same choice is available on the ``harvest_objects_import`` API action
+via the ``config_version`` parameter (``original`` or ``current``).
+
 Authorization
 =============
 

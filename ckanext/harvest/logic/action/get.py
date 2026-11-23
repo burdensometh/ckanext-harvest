@@ -13,11 +13,13 @@ from ckan.logic import NotFound, check_access, side_effect_free
 
 from ckanext.harvest import model as harvest_model
 
-from ckanext.harvest.model import (HarvestSource, HarvestJob, HarvestObject, HarvestLog)
+from ckanext.harvest.model import (HarvestSource, HarvestJob, HarvestObject,
+                                   HarvestLog, HarvestConfigVersion)
 from ckanext.harvest.logic.dictization import (harvest_source_dictize,
                                                harvest_job_dictize,
                                                harvest_object_dictize,
-                                               harvest_log_dictize)
+                                               harvest_log_dictize,
+                                               harvest_config_version_dictize)
 
 log = logging.getLogger(__name__)
 
@@ -166,7 +168,10 @@ def harvest_job_report(context, data_dict):
 
     report = {
         'gather_errors': [],
-        'object_errors': {}
+        'object_errors': {},
+        # The source configuration this job is being processed with
+        'config_version': harvest_config_version_dictize(
+            job.config_version, context),
     }
 
     # Gather errors
@@ -244,6 +249,38 @@ def harvest_job_list(context, data_dict):
 
     context['return_error_summary'] = False
     return [harvest_job_dictize(job, context) for job in jobs]
+
+
+@side_effect_free
+def harvest_config_version_list(context, data_dict):
+    '''Returns the config versions confirmed for a harvest source, newest
+    first.
+
+    Each harvest job pins one of these versions when it is created, so the
+    list provides the traceable history of the source configuration
+    (config string and default owner org) that jobs were processed with.
+
+    :param source_id: the id of the harvest source
+    :type source_id: string
+    '''
+
+    check_access('harvest_config_version_list', context, data_dict)
+
+    session = context['session']
+
+    source_id = logic.get_or_bust(data_dict, 'source_id')
+
+    source = HarvestSource.get(source_id)
+    if not source:
+        raise NotFound('Harvest source %s does not exist' % source_id)
+
+    versions = session.query(HarvestConfigVersion) \
+        .filter(HarvestConfigVersion.source_id == source.id) \
+        .order_by(HarvestConfigVersion.version.desc()) \
+        .all()
+
+    return [harvest_config_version_dictize(version, context)
+            for version in versions]
 
 
 @side_effect_free

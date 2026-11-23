@@ -28,7 +28,8 @@ from ckanext.harvest.utils import (
 from ckanext.harvest.queue import (
     get_gather_publisher, resubmit_jobs, resubmit_objects)
 
-from ckanext.harvest.model import HarvestSource, HarvestJob, HarvestObject, HarvestGatherError
+from ckanext.harvest.model import (HarvestSource, HarvestJob, HarvestObject,
+                                   HarvestGatherError, HarvestConfigVersion)
 from ckanext.harvest.logic import HarvestJobExists
 from ckanext.harvest.logic.dictization import harvest_job_dictize
 
@@ -141,6 +142,7 @@ def harvest_source_clear(context, data_dict):
     DELETE FROM harvest_gather_error WHERE harvest_job_id IN (
         SELECT id FROM harvest_job WHERE source_id = '{harvest_source_id}');
     DELETE FROM harvest_job WHERE source_id = '{harvest_source_id}';
+    DELETE FROM harvest_config_version WHERE source_id = '{harvest_source_id}';
     """
 
     if toolkit.check_ckan_version(max_version="2.10.99"):
@@ -363,6 +365,9 @@ def harvest_source_job_history_clear(context, data_dict):
         DELETE FROM harvest_job AS job WHERE source_id = '{harvest_source_id}'
          AND job.status != 'Running'
          AND NOT EXISTS (SELECT id FROM harvest_object WHERE harvest_job_id = job.id);
+        DELETE FROM harvest_config_version WHERE source_id = '{harvest_source_id}'
+         AND id NOT IN (SELECT config_version_id FROM harvest_job
+                        WHERE config_version_id IS NOT NULL);
         COMMIT;
         '''.format(harvest_source_id=harvest_source_id)
     else:
@@ -375,6 +380,7 @@ def harvest_source_job_history_clear(context, data_dict):
         DELETE FROM harvest_gather_error WHERE harvest_job_id
          IN (SELECT id FROM harvest_job WHERE source_id = '{harvest_source_id}');
         DELETE FROM harvest_job WHERE source_id = '{harvest_source_id}';
+        DELETE FROM harvest_config_version WHERE source_id = '{harvest_source_id}';
         COMMIT;
         '''.format(harvest_source_id=harvest_source_id)
 
@@ -454,6 +460,12 @@ def harvest_objects_import(context, data_dict):
     :type harvest_object_id: string
     :param package_id: the id or name of the package to import
     :type package_id: string
+    :param config_version: which source configuration to process the
+        objects with: 'original' (default) uses the config version pinned
+        to each object's job when it was created, 'current' uses the
+        source's current configuration (which is confirmed and stored as a
+        new traceable config version)
+    :type config_version: string
     '''
     log.info('Harvest objects import: %r', data_dict)
     check_access('harvest_objects_import', context, data_dict)
@@ -463,6 +475,14 @@ def harvest_objects_import(context, data_dict):
     guid = data_dict.get('guid')
     harvest_object_id = data_dict.get('harvest_object_id')
     package_id_or_name = data_dict.get('package_id')
+
+    config_version = data_dict.get('config_version', 'original')
+    if config_version not in ('original', 'current'):
+        raise toolkit.ValidationError(
+            {'config_version': [
+                'Must be "original" (the config version pinned to each '
+                'object\'s job) or "current" (the source\'s current '
+                'configuration)']})
 
     segments = context.get('segments')
 
@@ -515,6 +535,13 @@ def harvest_objects_import(context, data_dict):
 
     last_objects_count = 0
 
+    # Cache of the config versions confirmed for the 'current' replay mode,
+    # keyed by source id, so sources are only re-resolved once per run
+    current_config_versions = {}
+    # Keeps track of the config versions actually used, for reporting:
+    # {(source_id, version_label): object_count}
+    used_config_versions = {}
+
     for obj_id in last_objects_ids:
         _id = obj_id[0]
         if isinstance(_id, str):
@@ -524,6 +551,17 @@ def harvest_objects_import(context, data_dict):
 
         obj = session.query(HarvestObject).get(obj_id)
 
+        if config_version == 'current' and obj.job is not None:
+            # Replay with the source's current configuration: confirm the
+            # live config as a traceable version and use it for this run
+            # instead of the version originally pinned to the job. The
+            # override is transient, the job keeps its original pin.
+            if obj.harvest_source_id not in current_config_versions:
+                current_config_versions[obj.harvest_source_id] = \
+                    HarvestConfigVersion.get_or_create_for_source(obj.source)
+            obj.job._config_version_override = \
+                current_config_versions[obj.harvest_source_id]
+
         for harvester in PluginImplementations(IHarvester):
             if harvester.info()['name'] == obj.source.type:
                 if hasattr(harvester, 'force_import'):
@@ -531,6 +569,19 @@ def harvest_objects_import(context, data_dict):
                 harvester.import_stage(obj)
                 break
         last_objects_count += 1
+
+        if obj.job is not None:
+            used_version = obj.job.get_config_version()
+            version_label = ('v{}'.format(used_version.version)
+                             if used_version is not None else 'unpinned')
+            key = (obj.harvest_source_id, version_label)
+            used_config_versions[key] = used_config_versions.get(key, 0) + 1
+
+    for (used_source_id, version_label), count in used_config_versions.items():
+        log.info(
+            'Harvest objects import: %i object(s) from source %s imported '
+            'with config version %s', count, used_source_id, version_label)
+
     log.info('Harvest objects imported: %s', last_objects_count)
     return last_objects_count
 
@@ -720,10 +771,22 @@ def get_mail_extra_vars(context, source_id, status):
     else:
         organization = 'Not specified'
 
-    harvest_configuration = source.get('config')
+    # Report the configuration the job was actually processed with: the
+    # config version pinned to the job, falling back to the live source
+    # config for jobs without a pinned version.
+    job_config_version = last_job.get('config_version') or {}
+    harvest_configuration = job_config_version.get('config') or \
+        source.get('config')
 
     if harvest_configuration in [None, '', '{}']:
         harvest_configuration = 'Not specified'
+
+    if job_config_version:
+        config_version_label = 'v{0} (confirmed {1})'.format(
+            job_config_version.get('version'),
+            job_config_version.get('created'))
+    else:
+        config_version_label = ''
 
     errors = job_errors + obj_errors
 
@@ -737,6 +800,7 @@ def get_mail_extra_vars(context, source_id, status):
         'job_url': full_job_url,
         'harvest_source_title': source['title'],
         'harvest_configuration': harvest_configuration,
+        'config_version': config_version_label,
         'job_finished': last_job['finished'],
         'job_id': last_job['id'],
         'job_created': last_job['created'],

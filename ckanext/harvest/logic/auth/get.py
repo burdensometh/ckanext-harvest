@@ -107,6 +107,18 @@ def harvest_job_list(context, data_dict):
 
 
 @auth_allow_anonymous_access
+def harvest_config_version_list(context, data_dict):
+    '''
+        Authorization check for listing the config versions of a source
+
+        It forwards the checks to harvest_source_show, ie if the user can
+        see the source (including its current configuration), she can see
+        the confirmed config versions as well.
+    '''
+    return harvest_source_show(context, {'id': data_dict['source_id']})
+
+
+@auth_allow_anonymous_access
 def harvest_object_show(context, data_dict):
     '''
         Authorization check for getting the contents of a harvest object

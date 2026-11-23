@@ -187,7 +187,10 @@ class CKANHarvester(HarvesterBase):
         toolkit.requires_ckan_version(min_version='2.0')
         get_all_packages = True
 
-        self._set_config(harvest_job.source.config)
+        # Use the config pinned to the job, so that all objects of this job
+        # are processed with the configuration confirmed when the job was
+        # created, even if the source is edited while the job is queued.
+        self._set_config(harvest_job.get_config())
 
         # Get source URL
         remote_ckan_base_url = harvest_job.source.url.rstrip('/')
@@ -387,7 +390,7 @@ class CKANHarvester(HarvesterBase):
                                     harvest_object, 'Import')
             return False
 
-        self._set_config(harvest_object.job.source.config)
+        self._set_config(harvest_object.job.get_config())
 
         try:
             package_dict = json.loads(harvest_object.content)
@@ -451,9 +454,11 @@ class CKANHarvester(HarvesterBase):
 
                 package_dict['groups'] = validated_groups
 
-            # Local harvest source organization
-            source_dataset = get_action('package_show')(base_context.copy(), {'id': harvest_object.source.id})
-            local_org = source_dataset.get('owner_org')
+            # Local harvest source organization. Use the owner org pinned
+            # to the job (confirmed when the job was created); falls back
+            # to the source dataset's live owner org for jobs without a
+            # pinned config version.
+            local_org = harvest_object.job.get_owner_org()
 
             remote_orgs = self.config.get('remote_orgs', None)
 

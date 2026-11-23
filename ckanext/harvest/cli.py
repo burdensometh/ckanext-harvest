@@ -305,8 +305,19 @@ def run_test(ctx, id, force_import=None):
     help="""A string containing hex digits that represent which of
  the 16 harvest object segments to import. e.g. 15af will run segments 1,5,a,f""",
 )
+@click.option(
+    "--config-version",
+    type=click.Choice(["original", "current"]),
+    default="original",
+    show_default=True,
+    help="""Which source configuration to process the objects with:
+ "original" uses the config version pinned to each object's job when it was
+ created, "current" uses the source's current configuration (confirmed and
+ stored as a new traceable config version).""",
+)
 def import_stage(
-    ctx, id, no_join_datasets, harvest_object_id, guid, package_id, segments
+    ctx, id, no_join_datasets, harvest_object_id, guid, package_id, segments,
+    config_version,
 ):
     """Perform the import stage with the last fetched objects, for a
     certain source or a single harvest object.
@@ -328,6 +339,11 @@ def import_stage(
     digits that represent which of the 16 harvest object segments to
     import. e.g. 15af will run segments 1,5,a,f
 
+    The --config-version flag selects which source configuration the
+    objects are processed with: the version originally pinned to their
+    job ("original", the default) or the source's current configuration
+    ("current").
+
     """
     flask_app = ctx.meta["flask_app"]
     with flask_app.test_request_context():
@@ -339,6 +355,7 @@ def import_stage(
                 guid,
                 package_id,
                 segments,
+                config_version,
             )
         except tk.ObjectNotFound:
             tk.error_shout(u"Source <{}> not found.".format(id))

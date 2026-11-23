@@ -3,7 +3,8 @@ Job URL: {{ job_url }}
 
 Harvest Source: {{ harvest_source_title }}
 Harvest Configuration: {{ harvest_configuration | safe }}
-
+{% if config_version %}Harvest Config Version: {{ config_version }}
+{% endif %}
 Organization: {{ organization }}
 
 Harvest Job Id: {{ job_id }}
