@@ -1,6 +1,7 @@
 import logging
 from ckan.lib.base import config
-from sqlalchemy import or_
+from sqlalchemy import or_, and_, func
+from sqlalchemy.orm import joinedload
 from ckan.model import User, Package
 import datetime
 
@@ -13,11 +14,14 @@ from ckan.logic import NotFound, check_access, side_effect_free
 
 from ckanext.harvest import model as harvest_model
 
-from ckanext.harvest.model import (HarvestSource, HarvestJob, HarvestObject, HarvestLog)
+from ckanext.harvest.model import (HarvestSource, HarvestJob, HarvestObject,
+                                   HarvestLog, HarvestObjectChange,
+                                   HarvestObjectError, HarvestGatherError)
 from ckanext.harvest.logic.dictization import (harvest_source_dictize,
                                                harvest_job_dictize,
                                                harvest_object_dictize,
-                                               harvest_log_dictize)
+                                               harvest_log_dictize,
+                                               harvest_object_change_dictize)
 
 log = logging.getLogger(__name__)
 
@@ -468,3 +472,337 @@ def harvest_get_notifications_recipients(context, data_dict):
                 })
 
     return recipients
+
+
+# Default page size and hard cap for the change / failure feeds
+_CHANGE_FEED_DEFAULT_LIMIT = 100
+_CHANGE_FEED_MAX_LIMIT = 1000
+
+
+def _parse_feed_limit(data_dict):
+    try:
+        limit = int(data_dict.get('limit', _CHANGE_FEED_DEFAULT_LIMIT))
+    except (TypeError, ValueError):
+        raise p.toolkit.ValidationError(
+            {'limit': ['Must be a positive integer']})
+    if limit < 1:
+        raise p.toolkit.ValidationError(
+            {'limit': ['Must be a positive integer']})
+    return min(limit, _CHANGE_FEED_MAX_LIMIT)
+
+
+def _parse_cursor(cursor):
+    """Decodes a ``(created, id)`` keyset cursor.
+
+    The two columns together give a total, stable ordering even when
+    several rows share the same timestamp.
+    """
+    if not cursor:
+        return None
+    try:
+        created_str, row_id = cursor.split('|', 1)
+        created = datetime.datetime.fromisoformat(created_str)
+    except (ValueError, AttributeError):
+        raise p.toolkit.ValidationError(
+            {'cursor': ['Invalid cursor value']})
+    return created, row_id
+
+
+def _encode_cursor(created, row_id):
+    return '{0}|{1}'.format(created.isoformat(), row_id)
+
+
+@side_effect_free
+def harvest_changes_list(context, data_dict):
+    '''Returns the paginated feed of dataset changes.
+
+    Only successfully published objects are represented here, as either
+    an ``added`` or ``updated`` change. Each harvest object produces at
+    most one change record (the mapping is unique), so re-processing the
+    same object can never duplicate an entry.
+
+    Pagination is keyset based and therefore stable while new records are
+    inserted: pass the ``next_cursor`` value of one page as ``cursor`` on
+    the next request. Plain ``offset`` is also supported for one-off
+    queries.
+
+    :param change_type: filter by ``added`` or ``updated``
+    :param source_id: filter by harvest source id
+    :param since: ISO datetime, only return changes created at/after it
+    :param until: ISO datetime, only return changes created before it
+    :param limit: page size (default 100, max 1000)
+    :param cursor: keyset pagination cursor from a previous response
+    :param offset: offset based pagination (mutually exclusive with
+        ``cursor``)
+
+    :rtype: dictionary with ``count``, ``results``, ``next_cursor`` and
+        ``prev_cursor`` keys.
+    '''
+    check_access('harvest_changes_list', context, data_dict)
+
+    session = context['session']
+    limit = _parse_feed_limit(data_dict)
+
+    query = session.query(HarvestObjectChange)
+
+    change_type = data_dict.get('change_type')
+    if change_type:
+        if change_type not in (HarvestObjectChange.CHANGE_ADDED,
+                               HarvestObjectChange.CHANGE_UPDATED):
+            raise p.toolkit.ValidationError({
+                'change_type': ['Must be one of: added, updated']
+            })
+        query = query.filter(
+            HarvestObjectChange.change_type == change_type)
+
+    source_id = data_dict.get('source_id')
+    if source_id:
+        query = query.filter(
+            HarvestObjectChange.harvest_source_id == source_id)
+
+    since = data_dict.get('since')
+    if since:
+        query = query.filter(HarvestObjectChange.created >= since)
+
+    until = data_dict.get('until')
+    if until:
+        query = query.filter(HarvestObjectChange.created < until)
+
+    # Total, deterministic ordering: newest first, id as tie breaker so
+    # rows with identical timestamps always come out in the same order.
+    query = query.options(joinedload(HarvestObjectChange.source))
+    query = query.order_by(HarvestObjectChange.created.desc(),
+                           HarvestObjectChange.id.desc())
+
+    cursor = _parse_cursor(data_dict.get('cursor'))
+    if cursor:
+        created, row_id = cursor
+        query = query.filter(
+            or_(HarvestObjectChange.created < created,
+                and_(HarvestObjectChange.created == created,
+                     HarvestObjectChange.id < row_id)))
+    elif data_dict.get('offset'):
+        try:
+            offset = int(data_dict.get('offset'))
+        except (TypeError, ValueError):
+            raise p.toolkit.ValidationError(
+                {'offset': ['Must be a non-negative integer']})
+        if offset < 0:
+            raise p.toolkit.ValidationError(
+                {'offset': ['Must be a non-negative integer']})
+        query = query.offset(offset)
+
+    count = query.order_by(None).count()
+    # Fetch one extra row to know whether another page exists
+    rows = query.limit(limit + 1).all()
+    has_next = len(rows) > limit
+    page = rows[:limit]
+
+    results = [harvest_object_change_dictize(row, context)
+               for row in page]
+
+    next_cursor = None
+    if has_next and page:
+        next_cursor = _encode_cursor(page[-1].created, page[-1].id)
+
+    return {
+        'count': count,
+        'results': results,
+        'limit': limit,
+        'next_cursor': next_cursor,
+    }
+
+
+@side_effect_free
+def harvest_changes_failed_list(context, data_dict):
+    '''Returns the paginated feed of objects that could not be processed.
+
+    Failures are kept independent from successful changes. The feed
+    merges two kinds of records:
+
+    * object errors (``harvest_object_error``): fetch/import failures
+      attached to a gathered object, identified by its guid;
+    * gather errors (``harvest_gather_error``): job-level failures where
+      no object could be gathered at all.
+
+    One object appears at most once per page even if it accumulated
+    several error messages: all messages are returned together on the
+    single entry.
+
+    The same filtering, keyset cursor and limit semantics as
+    ``harvest_changes_list`` apply.
+    '''
+    check_access('harvest_changes_failed_list', context, data_dict)
+
+    session = context['session']
+    limit = _parse_feed_limit(data_dict)
+    source_id = data_dict.get('source_id')
+    since = data_dict.get('since')
+    until = data_dict.get('until')
+
+    object_filters = []
+    gather_filters = []
+    if source_id:
+        object_filters.append(
+            HarvestObject.harvest_source_id == source_id)
+        gather_filters.append(HarvestJob.source_id == source_id)
+    if since:
+        object_filters.append(HarvestObjectError.created >= since)
+        gather_filters.append(HarvestGatherError.created >= since)
+    if until:
+        object_filters.append(HarvestObjectError.created < until)
+        gather_filters.append(HarvestGatherError.created < until)
+
+    # Latest error per harvest object, one row per object regardless of
+    # how many error messages it accumulated.
+    latest_object_error = (
+        session.query(
+            HarvestObjectError.harvest_object_id.label('ref_id'),
+            func.max(HarvestObjectError.created).label('created'),
+        )
+        .group_by(HarvestObjectError.harvest_object_id)
+        .subquery()
+    )
+    object_query = (
+        session.query(
+            latest_object_error.c.created.label('created'),
+            latest_object_error.c.ref_id.label('ref_id'),
+        )
+        .join(HarvestObject,
+              HarvestObject.id == latest_object_error.c.ref_id)
+        .filter(*object_filters)
+    )
+
+    gather_query = (
+        session.query(
+            HarvestGatherError.created.label('created'),
+            HarvestGatherError.id.label('ref_id'),
+        )
+        .join(HarvestJob,
+              HarvestJob.id == HarvestGatherError.harvest_job_id)
+        .filter(*gather_filters)
+    )
+
+    unioned = object_query.union_all(gather_query).subquery()
+    feed_query = session.query(
+        unioned.c.created, unioned.c.ref_id
+    ).order_by(unioned.c.created.desc(), unioned.c.ref_id.desc())
+
+    cursor = _parse_cursor(data_dict.get('cursor'))
+    if cursor:
+        created, row_id = cursor
+        feed_query = feed_query.filter(
+            or_(unioned.c.created < created,
+                and_(unioned.c.created == created,
+                     unioned.c.ref_id < row_id)))
+    elif data_dict.get('offset'):
+        try:
+            offset = int(data_dict.get('offset'))
+        except (TypeError, ValueError):
+            raise p.toolkit.ValidationError(
+                {'offset': ['Must be a non-negative integer']})
+        if offset < 0:
+            raise p.toolkit.ValidationError(
+                {'offset': ['Must be a non-negative integer']})
+        feed_query = feed_query.offset(offset)
+
+    count = session.query(unioned).count()
+    rows = feed_query.limit(limit + 1).all()
+    has_next = len(rows) > limit
+    page = rows[:limit]
+
+    object_ids = []
+    gather_ids = []
+    # The two subqueries can never share an id (object vs gather error
+    # tables have independent primary keys), so classify by existence in
+    # the harvest_object table in a single query.
+    existing_object_ids = {
+        row[0] for row in session.query(HarvestObject.id)
+        .filter(HarvestObject.id.in_(
+            [ref_id for _created, ref_id in page] or [None]))
+        .all()
+    }
+    for _created, ref_id in page:
+        if ref_id in existing_object_ids:
+            object_ids.append(ref_id)
+        else:
+            gather_ids.append(ref_id)
+
+    object_errors = (
+        session.query(HarvestObjectError)
+        .filter(HarvestObjectError.harvest_object_id.in_(
+            object_ids or [None]))
+        .all()
+    )
+    gather_errors = (
+        session.query(HarvestGatherError)
+        .filter(HarvestGatherError.id.in_(gather_ids or [None]))
+        .all()
+    )
+    objects = {
+        obj.id: obj
+        for obj in session.query(HarvestObject)
+        .filter(HarvestObject.id.in_(object_ids or [None]))
+        .all()
+    }
+    gather_by_id = {err.id: err for err in gather_errors}
+
+    results = []
+    for created, ref_id in page:
+        if ref_id in objects:
+            obj = objects[ref_id]
+            results.append({
+                'failure_type': 'object_error',
+                'id': obj.id,
+                'created': created.isoformat(),
+                'harvest_source_id': obj.harvest_source_id,
+                'harvest_job_id': obj.harvest_job_id,
+                'guid': obj.guid,
+                'package_id': obj.package_id,
+                'state': obj.state,
+                'errors': [
+                    {
+                        'message': err.message,
+                        'stage': err.stage,
+                        'line': err.line,
+                        'created': err.created.isoformat()
+                        if err.created else None,
+                    }
+                    for err in object_errors
+                    if err.harvest_object_id == obj.id
+                ],
+            })
+        elif ref_id in gather_by_id:
+            err = gather_by_id[ref_id]
+            results.append({
+                'failure_type': 'gather_error',
+                'id': err.id,
+                'created': created.isoformat(),
+                'harvest_source_id': err.job.source_id
+                if err.job else None,
+                'harvest_job_id': err.harvest_job_id,
+                'guid': None,
+                'package_id': None,
+                'state': None,
+                'errors': [
+                    {
+                        'message': err.message,
+                        'stage': 'Gather',
+                        'line': None,
+                        'created': err.created.isoformat()
+                        if err.created else None,
+                    }
+                ],
+            })
+
+    next_cursor = None
+    if has_next and page:
+        last_created, last_id = page[-1]
+        next_cursor = _encode_cursor(last_created, last_id)
+
+    return {
+        'count': count,
+        'results': results,
+        'limit': limit,
+        'next_cursor': next_cursor,
+    }

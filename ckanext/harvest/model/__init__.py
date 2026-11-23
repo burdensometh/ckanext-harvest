@@ -1,11 +1,13 @@
 import logging
 import datetime
+import json
 
 from sqlalchemy import event
 from sqlalchemy import Column
 from sqlalchemy import ForeignKey
 from sqlalchemy import types
 from sqlalchemy import Index
+from sqlalchemy import UniqueConstraint
 from sqlalchemy.orm import backref, relationship
 from sqlalchemy.exc import InvalidRequestError
 
@@ -247,6 +249,97 @@ class HarvestObject(BaseModel, HarvestDomainObject):
         lazy="select",
         backref="objects",
     )
+
+
+class HarvestObjectChange(BaseModel, HarvestDomainObject):
+    """A change record describing what happened to a dataset during a
+    harvest, suitable for nightly feeds to data consumers.
+
+    A row is only created for successfully published harvest objects
+    (``report_status`` of *added* or *updated*). Failures are reported
+    separately from ``harvest_object_error`` / ``harvest_gather_error``.
+
+    The unique constraint on ``harvest_object_id`` makes recording
+    idempotent: processing the same harvest object again (for instance a
+    re-run of the import stage) never produces two change records.
+    """
+
+    __tablename__ = "harvest_object_change"
+    __table_args__ = (
+        UniqueConstraint(
+            "harvest_object_id", name="harvest_object_change_object_id_key"
+        ),
+    )
+
+    # change_type: 'added', 'updated'
+    CHANGE_ADDED = "added"
+    CHANGE_UPDATED = "updated"
+
+    id = Column(types.UnicodeText, primary_key=True, default=make_uuid)
+    harvest_object_id = Column(
+        types.UnicodeText,
+        ForeignKey("harvest_object.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    harvest_job_id = Column(
+        types.UnicodeText,
+        ForeignKey("harvest_job.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    harvest_source_id = Column(
+        types.UnicodeText,
+        ForeignKey("harvest_source.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    package_id = Column(
+        types.UnicodeText,
+        ForeignKey("package.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    # Source identity of the dataset, as reported by the remote source
+    guid = Column(types.UnicodeText, default="")
+    change_type = Column(types.UnicodeText, nullable=False)
+    # JSON document with field-level detail. For 'updated' records it
+    # contains the title, license and resource list changes, for 'added'
+    # records it describes the dataset as it was first imported.
+    change_details = Column(types.UnicodeText, nullable=True)
+    created = Column(types.DateTime, default=datetime.datetime.utcnow)
+
+    object = relationship(
+        HarvestObject,
+        backref=backref("change", uselist=False, cascade="all,delete-orphan"),
+    )
+    job = relationship(HarvestJob, backref="object_changes")
+    source = relationship(HarvestSource, backref="object_changes")
+
+    harvest_object_change_source_idx = Index(
+        "harvest_object_change_source_id_idx", "harvest_source_id"
+    )
+    harvest_object_change_job_idx = Index(
+        "harvest_object_change_job_id_idx", "harvest_job_id"
+    )
+    harvest_object_change_created_idx = Index(
+        "harvest_object_change_created_idx", "created"
+    )
+    harvest_object_change_type_idx = Index(
+        "harvest_object_change_type_idx", "change_type"
+    )
+    harvest_object_change_guid_idx = Index(
+        "harvest_object_change_guid_idx", "guid"
+    )
+
+    @property
+    def details(self):
+        """Parsed ``change_details`` JSON document (or ``{}``)."""
+        if not self.change_details:
+            return {}
+        try:
+            return json.loads(self.change_details)
+        except (TypeError, ValueError):
+            log.warning(
+                "Invalid JSON in harvest_object_change %s", self.id
+            )
+            return {}
 
 
 class HarvestObjectExtra(BaseModel, HarvestDomainObject):

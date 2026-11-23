@@ -3,7 +3,20 @@ from sqlalchemy import func, text
 from ckan.model import Group
 from ckan import logic
 from ckanext.harvest.model import (HarvestJob, HarvestObject,
-                                   HarvestGatherError, HarvestObjectError)
+                                   HarvestGatherError, HarvestObjectError,
+                                   HarvestObjectChange)
+
+
+def harvest_object_change_dictize(change, context):
+    """Serializes a change record for the change feed API."""
+    out = change.as_dict()
+    out["details"] = change.details
+    out["harvest_source"] = {
+        "id": change.harvest_source_id,
+        "title": change.source.title if change.source else None,
+        "url": change.source.url if change.source else None,
+    }
+    return out
 
 
 def harvest_source_dictize(source, context, last_job_status=False):

@@ -559,6 +559,20 @@ def fetch_and_import_stages(harvester, obj):
         obj.report_status = 'added'
     obj.save()
 
+    # Successful publications feed the change log. Failures stay on the
+    # error tables and are reported separately, and the writer is
+    # idempotent so re-processing the same object does not duplicate rows.
+    if obj.report_status in ('added', 'updated'):
+        from ckanext.harvest.changes import record_harvest_object_change
+        try:
+            record_harvest_object_change(obj)
+            model.Session.commit()
+        except Exception:
+            log.exception(
+                'Failed to record harvest change for object %s', obj.id
+            )
+            model.Session.rollback()
+
 
 def get_gather_consumer():
     gather_routing_key = get_gather_routing_key()

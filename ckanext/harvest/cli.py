@@ -2,6 +2,8 @@
 
 from __future__ import print_function
 
+import json
+
 import ckantoolkit as tk
 import click
 
@@ -393,3 +395,91 @@ def harvesters_info(ctx):
         result = utils.harvesters_info()
 
     click.echo(result)
+
+
+@harvester.group("changes")
+def changes():
+    """Nightly change feed for data consumers.
+    """
+    pass
+
+
+@changes.command("list")
+@click.option(
+    "--change-type",
+    type=click.Choice(["added", "updated"]),
+    help="Only return changes of this type.",
+)
+@click.option("--source-id", help="Only return changes for this source.")
+@click.option(
+    "--since",
+    help="ISO datetime; only changes created at/after this point.",
+)
+@click.option(
+    "--until",
+    help="ISO datetime; only changes created before this point.",
+)
+@click.option("--limit", type=int, default=100, help="Page size.")
+@click.option(
+    "--cursor",
+    help="Keyset cursor (next_cursor value from the previous page).",
+)
+@click.pass_context
+def changes_list(ctx, change_type, source_id, since, until, limit,
+                 cursor):
+    """Lists successfully published dataset changes as JSON.
+
+    The output contains a ``next_cursor`` field that can be passed to
+    the next invocation to walk the whole feed in stable order.
+    """
+    data_dict = {
+        "change_type": change_type,
+        "source_id": source_id,
+        "since": since,
+        "until": until,
+        "limit": limit,
+        "cursor": cursor,
+    }
+    flask_app = ctx.meta["flask_app"]
+    with flask_app.test_request_context():
+        result = tk.get_action("harvest_changes_list")(
+            {"ignore_auth": True}, data_dict
+        )
+    click.echo(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+@changes.command("failed")
+@click.option("--source-id", help="Only return failures for this source.")
+@click.option(
+    "--since",
+    help="ISO datetime; only failures recorded at/after this point.",
+)
+@click.option(
+    "--until",
+    help="ISO datetime; only failures recorded before this point.",
+)
+@click.option("--limit", type=int, default=100, help="Page size.")
+@click.option(
+    "--cursor",
+    help="Keyset cursor (next_cursor value from the previous page).",
+)
+@click.pass_context
+def changes_failed(ctx, source_id, since, until, limit, cursor):
+    """Lists objects that could not be processed, as JSON.
+
+    This feed is independent from the successful change list and merges
+    object-level and gather-level failures.
+    """
+    data_dict = {
+        "source_id": source_id,
+        "since": since,
+        "until": until,
+        "limit": limit,
+        "cursor": cursor,
+    }
+    flask_app = ctx.meta["flask_app"]
+    with flask_app.test_request_context():
+        result = tk.get_action("harvest_changes_failed_list")(
+            {"ignore_auth": True}, data_dict
+        )
+    click.echo(json.dumps(result, indent=2, ensure_ascii=False))

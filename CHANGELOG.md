@@ -2,6 +2,8 @@
 
 ## [Unreleased](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...HEAD)
 
+* Add a stable, paginated change feed for data consumers: new `harvest_object_change` table records each successfully published harvest object exactly once as an `added` or `updated` change (with title, license and resource list diffs), exposed via the `harvest_changes_list` API action and the `ckan harvester changes list` CLI command. Unprocessable objects and gather failures are reported independently through `harvest_changes_failed_list` and `ckan harvester changes failed`.
+
 ## [v1.6.3](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...v1.6.3) - 2026-08-12
 
 * The extension can now be installed via `pip install ckanext-harvest`: included requirements in pyproject.toml. To use the RabbitMQ backend, use `pip install ckanext-harvest[amqp]`.

@@ -134,6 +134,28 @@ def harvesters_info_show(context, data_dict):
     return {'success': True}
 
 
+@auth_allow_anonymous_access
+def harvest_changes_list(context, data_dict):
+    '''
+        Authorization check for the dataset change feed.
+
+        The feed is the nightly contract with data consumers and only
+        contains data already published through harvested datasets, so
+        anonymous access is allowed. Site admins can still restrict it
+        globally via their authorization settings.
+    '''
+    return {'success': True}
+
+
+@auth_allow_anonymous_access
+def harvest_changes_failed_list(context, data_dict):
+    '''
+        Authorization check for the feed of objects that could not be
+        processed. Same open policy as the successful change feed.
+    '''
+    return {'success': True}
+
+
 def harvest_get_notifications_recipients(context, data_dict):
     # Only sysadmins can access this
     return {'success': False}

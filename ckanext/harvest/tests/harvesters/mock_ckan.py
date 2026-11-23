@@ -108,8 +108,8 @@ class MockCkanHandler(SimpleHTTPRequestHandler):
                     del params['sort']
                 if params['start'] != '0':
                     datasets = []
-                elif set(params.keys()) == set(['rows', 'start']):
-                    datasets = ['dataset1', DATASETS[1]['name']]
+                if set(params.keys()) == set(['rows', 'start']):
+                    datasets = [d['name'] for d in DATASETS]
                 elif set(params.keys()) == set(['fq', 'rows', 'start']) and \
                         params['fq'] == '-organization:org1':
                     datasets = [DATASETS[1]['name']]
@@ -128,7 +128,12 @@ class MockCkanHandler(SimpleHTTPRequestHandler):
                         'Spaces should not be decoded by now - seeing + '\
                         'means they were double encoded and SOLR doesnt like '\
                         'that'
-                    datasets = [DATASETS[1]['name']]
+                    # Tests patch DATASETS with arbitrary contents, so
+                    # answer dynamically instead of assuming a fixed
+                    # second dataset. Return everything currently
+                    # served; unchanged datasets are filtered out by the
+                    # harvester itself.
+                    datasets = [d['name'] for d in DATASETS]
                 else:
                     return self.respond(
                         'Not implemented search params %s' % params,
@@ -189,6 +194,11 @@ class MockCkanHandler(SimpleHTTPRequestHandler):
 def serve(port=PORT):
     '''Runs a CKAN-alike app (over HTTP) that is used for harvesting tests'''
 
+    # Several test modules call this at import time; only bind the port
+    # once per test session.
+    if getattr(serve, "_httpd", None) is not None:
+        return
+
     # Choose the directory to serve files from
     # os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)),
     #                      'mock_ckan_files'))
@@ -197,6 +207,7 @@ def serve(port=PORT):
         allow_reuse_address = True
 
     httpd = TestServer(("", PORT), MockCkanHandler)
+    serve._httpd = httpd
 
     print('Serving test HTTP server at port {}'.format(PORT))
 

@@ -177,6 +177,82 @@ e.g. Fetch all logs with log level INFO::
     }
 
 
+Nightly change feed for data consumers
+======================================
+
+Every successfully published harvest object produces a change record
+describing what happened to the local dataset. Records are written once
+per harvest object (the mapping is unique), so re-processing the same
+object — a retry or a manual reimport — never produces duplicates.
+Objects that could not be processed are reported separately and never
+mixed into the successful change feed.
+
+Two API actions are available, both allowing anonymous access:
+
+* ``harvest_changes_list`` — the successful changes. Each record is
+  typed ``added`` or ``updated`` and carries the harvest source, the
+  source identity of the dataset (``guid``), the local package id, the
+  creation time and a JSON ``details`` document. For updates the
+  details break the change down into title, license and resource list
+  differences.
+
+* ``harvest_changes_failed_list`` — the objects that could not be
+  processed, merging object-level fetch/import errors (with their
+  ``guid`` and every accumulated error message) and job-level gather
+  errors.
+
+Both actions share the same parameters:
+
+* ``source_id`` (only records for this harvest source)
+
+* ``change_type`` (``added`` or ``updated``, change feed only)
+
+* ``since`` / ``until`` (ISO datetimes bounding the record time)
+
+* ``limit`` (page size, default 100, maximum 1000)
+
+* ``cursor`` (stable keyset pagination: pass the ``next_cursor`` value
+  from the previous response)
+
+* ``offset`` (offset based pagination for one-off queries)
+
+Example::
+
+    $ curl "{ckan_url}/api/3/action/harvest_changes_list?limit=100"
+
+    {
+      "success": true,
+      "result": {
+        "count": 124,
+        "limit": 100,
+        "next_cursor": "2026-11-22T23:00:04.123456|a4c1e7d9-...",
+        "results": [
+          {
+            "id": "...",
+            "change_type": "updated",
+            "guid": "remote-dataset-id",
+            "package_id": "local-package-id",
+            "harvest_source_id": "...",
+            "harvest_job_id": "...",
+            "created": "2026-11-22T23:00:04.123456",
+            "harvest_source": {"id": "...", "title": "Source", "url": "..."},
+            "details": {
+              "changed_fields": ["title", "resources"],
+              "title": {"old": "Old title", "new": "New title"},
+              "resources": {"added": [...], "removed": [...], "unchanged": [...]}
+            }
+          }
+        ]
+      }
+    }
+
+The same feeds can be generated from the command line for scheduled
+nightly delivery::
+
+    $ ckan harvester changes list --since 2026-11-22T00:00:00
+    $ ckan harvester changes failed --since 2026-11-22T00:00:00
+
+
 Dataset name generation configuration (optional)
 ================================================
 
