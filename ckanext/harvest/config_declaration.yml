@@ -87,6 +87,23 @@ groups:
           no timeout on harvest jobs.
         example: 1440
 
+      - key: ckan.harvest.fetch_queue.max_objects_per_batch
+        type: int
+        default: 100
+        description: |
+          Maximum number of waiting harvest objects sent to the fetch queue in
+          one batch. Batches are sent after each gather stage and on every
+          `harvest_jobs_run` call (e.g. from `ckan harvester run`).
+
+          The quota is shared out alternating between the sources that have
+          waiting objects, so that a source with a large backlog (e.g. the
+          first full inventory of a source) does not hold up urgent objects
+          from other sources. Each source keeps its own object order, and
+          every batch continues the rotation where the previous one stopped.
+
+          Set to 0 or a negative value to disable the limit and send all
+          waiting objects at once.
+
       - key: ckan.harvest.status_mail.all
         type: bool
         default: false

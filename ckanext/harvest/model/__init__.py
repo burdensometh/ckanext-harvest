@@ -217,6 +217,11 @@ class HarvestObject(BaseModel, HarvestDomainObject):
     import_finished = Column(types.DateTime)
     # state: WAITING, FETCH, IMPORT, COMPLETE, ERROR
     state = Column(types.UnicodeText, default="WAITING")
+    # When the object was dispatched (sent) to the fetch queue. NULL while
+    # the object is still waiting to be dispatched. Used to share out the
+    # fetch queue fairly between sources and to recognize objects that were
+    # already dispatched when a batch is re-run after a failure.
+    fetch_queued = Column(types.DateTime, nullable=True)
     metadata_modified_date = Column(types.DateTime)
     retry_times = Column(types.Integer, default=0)
     harvest_job_id = Column(types.UnicodeText, ForeignKey("harvest_job.id"))

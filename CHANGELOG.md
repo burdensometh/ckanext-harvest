@@ -2,6 +2,8 @@
 
 ## [Unreleased](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...HEAD)
 
+* Send waiting harvest objects to the fetch queue in limited batches, alternating between sources. A source with a large backlog (e.g. a first full inventory) no longer holds up urgent objects from other sources: the batch quota is shared out fairly between sources, each source keeps its own object order, and every batch continues the rotation where the previous one stopped. Objects are marked (`fetch_queued`) as they are dispatched, so re-running a batch after a failure does not send them again. The batch size is configurable via `ckan.harvest.fetch_queue.max_objects_per_batch` (defaults to 100, 0 means no limit). Requires a database migration (`fetch_queued` column on `harvest_object`).
+
 ## [v1.6.3](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...v1.6.3) - 2026-08-12
 
 * The extension can now be installed via `pip install ckanext-harvest`: included requirements in pyproject.toml. To use the RabbitMQ backend, use `pip install ckanext-harvest[amqp]`.

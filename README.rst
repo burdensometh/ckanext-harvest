@@ -678,6 +678,16 @@ this command before being able to create a new job on a source that was being
 harvested. (On a production site you will typically have a cron job that runs the
 command regularly, see next section).
 
+Gathered harvest objects are not sent to the fetch queue all at once, but in
+limited batches (after each gather stage and on every ``harvester run`` call).
+The batch quota is shared out alternating between the sources that have waiting
+objects, so that a source with a large backlog (e.g. the first full inventory
+of a source) does not hold up urgent objects from other sources. Each source
+keeps its own object order, and every batch continues the rotation where the
+previous one stopped. The batch size can be tuned with the
+``ckan.harvest.fetch_queue.max_objects_per_batch`` configuration option
+(defaults to 100, set it to 0 to send all waiting objects at once).
+
 Occasionally you can find a harvesting job is in a "limbo state" where the job
 has run with errors but the ``harvester run`` command will not mark it as
 finished, and therefore you cannot run another job. This is due to particular

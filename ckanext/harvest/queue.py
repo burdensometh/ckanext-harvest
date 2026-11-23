@@ -2,6 +2,7 @@ import logging
 import datetime
 import json
 
+from collections import deque
 
 import redis
 try:
@@ -36,6 +37,11 @@ REDIS_DB = 0
 # settings for AMQP
 EXCHANGE_TYPE = 'direct'
 EXCHANGE_NAME = 'ckan.harvest'
+
+# Default number of waiting harvest objects sent to the fetch queue in one
+# batch by send_waiting_objects_to_fetch_queue. Can be overridden with the
+# `ckan.harvest.fetch_queue.max_objects_per_batch` config option.
+MAX_OBJECTS_PER_FETCH_BATCH = 100
 
 
 def get_connection():
@@ -181,15 +187,21 @@ def resubmit_jobs():
 
 def resubmit_objects():
     '''
-    Resubmit all WAITING objects on the DB that are not present in Redis
+    Resubmit all WAITING objects on the DB that were already dispatched to
+    the fetch queue (``fetch_queued`` is set) but are not present in Redis.
+
+    Objects that have not been dispatched yet are left alone: they will be
+    sent to the fetch queue by ``send_waiting_objects_to_fetch_queue``,
+    respecting its per-batch quota.
     '''
     if config.get('ckan.harvest.mq.type') != 'redis':
         return
     redis = get_connection()
     publisher = get_fetch_publisher()
 
-    waiting_objects = model.Session.query(HarvestObject.id) \
-        .filter_by(state='WAITING') \
+    dispatched_objects = model.Session.query(HarvestObject.id) \
+        .filter(HarvestObject.state == 'WAITING') \
+        .filter(HarvestObject.fetch_queued.isnot(None)) \
         .all()
 
     objects_in_queue = []
@@ -198,12 +210,151 @@ def resubmit_objects():
     objects_in_queue = [json.loads(o)['harvest_object_id']
                         for o in redis.lrange(fetch_routing_key, 0, -1)]
 
-    for object_id, in waiting_objects:
+    for object_id, in dispatched_objects:
         if object_id not in objects_in_queue:
             log.debug('Re-sent object {} to the fetch queue'.format(object_id))
             publisher.send({'harvest_object_id': object_id})
 
     publisher.close()
+
+
+def _waiting_objects_filters():
+    '''Filters selecting harvest objects still waiting to be dispatched'''
+    return [
+        HarvestObject.state == 'WAITING',
+        HarvestObject.fetch_queued.is_(None),
+    ]
+
+
+def send_waiting_objects_to_fetch_queue(max_objects=None):
+    '''
+    Sends up to ``max_objects`` WAITING harvest objects to the fetch queue.
+
+    To stop a source with a large backlog (e.g. the first full inventory
+    of a big source) from holding up urgent objects from other sources,
+    the available quota is shared out alternating between the sources
+    that have waiting objects, one object per source at a time, keeping
+    each source's own object order. The next batch continues the
+    rotation where the previous one stopped, so every source keeps
+    getting a fair share of the fetch queue.
+
+    Each object is marked (``fetch_queued``) as it is dispatched, so if
+    a batch fails part way through and is re-run, the objects that were
+    already dispatched are recognized and not sent again.
+
+    :param max_objects: the quota for this batch. Defaults to the
+        ``ckan.harvest.fetch_queue.max_objects_per_batch`` config
+        option. A value of 0 or less means no limit.
+    :returns: the ids of the harvest objects sent to the fetch queue
+    '''
+    if max_objects is None:
+        try:
+            max_objects = int(config.get(
+                'ckan.harvest.fetch_queue.max_objects_per_batch',
+                MAX_OBJECTS_PER_FETCH_BATCH))
+        except ValueError:
+            max_objects = MAX_OBJECTS_PER_FETCH_BATCH
+    unlimited = max_objects <= 0
+
+    waiting_filters = _waiting_objects_filters()
+
+    # Sources with objects waiting to be dispatched, in a stable order
+    source_ids = [
+        row[0] for row in
+        model.Session.query(HarvestObject.harvest_source_id)
+        .filter(*waiting_filters)
+        .distinct()
+        .order_by(HarvestObject.harvest_source_id)
+        .all()
+    ]
+    if not source_ids:
+        return []
+
+    # Continue the rotation where the previous batch stopped: the last
+    # source served is the one the most recently dispatched object
+    # belongs to
+    last_dispatched = (
+        model.Session.query(HarvestObject.harvest_source_id)
+        .filter(HarvestObject.fetch_queued.isnot(None))
+        .order_by(HarvestObject.fetch_queued.desc(), HarvestObject.id.desc())
+        .first()
+    )
+    if last_dispatched:
+        last_source_id = last_dispatched[0]
+        source_ids = (
+            [s for s in source_ids if s > last_source_id] +
+            [s for s in source_ids if s <= last_source_id]
+        )
+
+    # Candidates for each source, in the source's own (gather) order
+    pending_by_source = {}
+    for source_id in source_ids:
+        query = (
+            model.Session.query(HarvestObject.id)
+            .filter(HarvestObject.harvest_source_id == source_id)
+            .filter(*waiting_filters)
+            .order_by(HarvestObject.gathered, HarvestObject.id)
+        )
+        if not unlimited:
+            query = query.limit(max_objects)
+        pending_by_source[source_id] = deque(row[0] for row in query.all())
+
+    # Alternate between the sources, one object at a time, until the
+    # quota is used up or there is nothing left to send
+    selected = []
+    while unlimited or len(selected) < max_objects:
+        found = False
+        for source_id in source_ids:
+            pending = pending_by_source[source_id]
+            if pending:
+                selected.append(pending.popleft())
+                found = True
+                if not unlimited and len(selected) >= max_objects:
+                    break
+        if not found:
+            break
+
+    if not selected:
+        return []
+
+    publisher = get_fetch_publisher()
+    sent = []
+    try:
+        for object_id in selected:
+            # Claim the object before sending it, so that objects that
+            # were already dispatched (e.g. when the same batch is
+            # re-run after a failure, or a concurrent dispatcher claimed
+            # it first) are recognized and skipped
+            claimed = (
+                model.Session.query(HarvestObject)
+                .filter(HarvestObject.id == object_id)
+                .filter(*waiting_filters)
+                .update(
+                    {'fetch_queued': datetime.datetime.utcnow()},
+                    synchronize_session=False)
+            )
+            model.Session.commit()
+            if not claimed:
+                continue
+            try:
+                publisher.send({'harvest_object_id': object_id})
+            except Exception:
+                # Could not be dispatched: release the claim so that a
+                # later batch tries to send it again
+                (
+                    model.Session.query(HarvestObject)
+                    .filter(HarvestObject.id == object_id)
+                    .update({'fetch_queued': None},
+                            synchronize_session=False)
+                )
+                model.Session.commit()
+                raise
+            sent.append(object_id)
+    finally:
+        publisher.close()
+
+    log.debug('Sent {0} objects to the fetch queue'.format(len(sent)))
+    return sent
 
 
 class Publisher(object):
@@ -359,9 +510,6 @@ def gather_callback(channel, method, header, body):
         channel.basic_ack(method.delivery_tag)
         return False
 
-    # Get a publisher for the fetch queue
-    publisher = get_fetch_publisher()
-
     try:
         job = HarvestJob.get(id)
     except sqlalchemy.exc.DatabaseError:
@@ -391,22 +539,22 @@ def gather_callback(channel, method, header, body):
 
         if not isinstance(harvest_object_ids, list):
             log.error('Gather stage failed')
-            publisher.close()
             channel.basic_ack(method.delivery_tag)
             return False
 
         if len(harvest_object_ids) == 0:
             log.info('No harvest objects to fetch')
-            publisher.close()
             channel.basic_ack(method.delivery_tag)
             return False
 
         log.debug('Received from plugin gather_stage: {0} objects (first: {1} last: {2})'.format(
             len(harvest_object_ids), harvest_object_ids[:1], harvest_object_ids[-1:]))
-        for id in harvest_object_ids:
-            # Send the id to the fetch queue
-            publisher.send({'harvest_object_id': id})
-        log.debug('Sent {0} objects to the fetch queue'.format(len(harvest_object_ids)))
+        # Send a first batch of the waiting objects to the fetch queue.
+        # Objects are sent in limited batches, alternating between
+        # sources, so that a source with many objects (e.g. a first full
+        # inventory) does not hold up the remaining sources. Further
+        # batches are sent on the next `harvest_jobs_run` calls.
+        send_waiting_objects_to_fetch_queue()
 
     else:
         # This can occur if you:
@@ -422,7 +570,6 @@ def gather_callback(channel, method, header, body):
                  job.source.url, job.id)
 
     model.Session.remove()
-    publisher.close()
     channel.basic_ack(method.delivery_tag)
 
 

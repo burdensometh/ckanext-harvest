@@ -26,7 +26,8 @@ from ckanext.harvest.utils import (
     DATASET_TYPE_NAME
 )
 from ckanext.harvest.queue import (
-    get_gather_publisher, resubmit_jobs, resubmit_objects)
+    get_gather_publisher, resubmit_jobs, resubmit_objects,
+    send_waiting_objects_to_fetch_queue)
 
 from ckanext.harvest.model import HarvestSource, HarvestJob, HarvestObject, HarvestGatherError
 from ckanext.harvest.logic import HarvestJobExists
@@ -686,6 +687,11 @@ def harvest_jobs_run(context, data_dict):
                     log.debug('%d Ongoing jobs for %s (source:%s)',
                               num_objects_in_progress, job['id'], job['source_id'])
     log.debug('No jobs to send to the gather queue')
+
+    # Send a batch of waiting objects to the fetch queue, alternating
+    # between sources so that a source with a large backlog does not
+    # hold up the remaining ones
+    send_waiting_objects_to_fetch_queue()
 
     # Resubmit old redis tasks
     resubmit_jobs()

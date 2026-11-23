@@ -1,11 +1,14 @@
 import pytest
 try:
-    from unittest.mock import patch
+    from unittest.mock import patch, Mock
 except ImportError:
-    from mock import patch
+    from mock import patch, Mock
+
+import datetime
 
 from ckanext.harvest.model import HarvestObject, HarvestObjectExtra
 from ckanext.harvest.interfaces import IHarvester
+from ckanext.harvest.tests import factories as harvest_factories
 import ckanext.harvest.queue as queue
 from ckan.plugins.core import SingletonPlugin, implements
 import json
@@ -325,6 +328,56 @@ class TestHarvestQueue(object):
         finally:
             redis.flushdb()
 
+    @pytest.mark.ckan_config('ckan.harvest.fetch_queue.max_objects_per_batch', 2)
+    def test_gather_sends_objects_in_limited_batches(self):
+        '''
+        After a gather, only a first limited batch of the waiting objects
+        is sent to the fetch queue. The next harvest_jobs_run call sends
+        the following batch.
+        '''
+        if config.get('ckan.harvest.mq.type') != 'redis':
+            pytest.skip()
+        redis = queue.get_connection()
+        fetch_routing_key = queue.get_fetch_routing_key()
+        redis.flushdb()
+        try:
+            consumer = queue.get_gather_consumer()
+            consumer_fetch = queue.get_fetch_consumer()
+            consumer.queue_purge(queue=queue.get_gather_queue_name())
+            consumer_fetch.queue_purge(queue=queue.get_fetch_queue_name())
+
+            user = toolkit.get_action('get_site_user')(
+                {'model': model, 'ignore_auth': True}, {}
+            )['name']
+
+            context = {'model': model, 'session': model.Session,
+                       'user': user, 'api_version': 3, 'ignore_auth': True}
+
+            harvest_source, job_id = \
+                self._create_harvest_job_and_finish_gather_stage(consumer, context)
+
+            # The gather created 3 objects, but only the first batch of
+            # 2 was sent to the fetch queue
+            assert redis.llen(fetch_routing_key) == 2
+            assert model.Session.query(HarvestObject) \
+                .filter_by(state='WAITING') \
+                .filter(HarvestObject.fetch_queued.isnot(None)) \
+                .count() == 2
+
+            # The next harvest_jobs_run call sends the following batch
+            toolkit.get_action('harvest_jobs_run')(
+                context,
+                {'source_id': harvest_source['id']}
+            )
+
+            assert redis.llen(fetch_routing_key) == 3
+            assert model.Session.query(HarvestObject) \
+                .filter_by(state='WAITING') \
+                .filter(HarvestObject.fetch_queued.is_(None)) \
+                .count() == 0
+        finally:
+            redis.flushdb()
+
     def _create_harvest_job_and_finish_gather_stage(self, consumer, context):
         source_dict = {'title': 'Test Source',
                        'name': 'test-source',
@@ -374,6 +427,134 @@ class TestHarvestQueue(object):
         assert len(model.Session.query(HarvestObjectExtra).all()) == 1
 
         return harvest_source, job_id
+
+
+@pytest.mark.usefixtures('with_plugins', 'clean_db', 'clean_queues')
+@pytest.mark.ckan_config('ckan.plugins', 'harvest test_harvester')
+class TestSendWaitingObjectsToFetchQueue(object):
+    '''
+    Tests for the fair, quota limited dispatch of waiting harvest
+    objects to the fetch queue.
+    '''
+
+    def setup_method(self):
+        if config.get('ckan.harvest.mq.type') != 'redis':
+            pytest.skip('These tests need the redis backend')
+        queue.get_connection().flushdb()
+
+    def teardown_method(self):
+        queue.get_connection().flushdb()
+
+    def _fetch_queue_object_ids(self):
+        redis = queue.get_connection()
+        return [
+            json.loads(o)['harvest_object_id']
+            for o in redis.lrange(queue.get_fetch_routing_key(), 0, -1)
+        ]
+
+    def _make_source_with_objects(self, num_objects):
+        source = harvest_factories.HarvestSourceObj(source_type='test')
+        job = harvest_factories.HarvestJobObj(source=source)
+        objects = []
+        for i in range(num_objects):
+            obj = harvest_factories.HarvestObjectObj(
+                job=job, guid='obj-{}-{}'.format(source.id, i))
+            # Make the source's own object order explicit
+            obj.gathered = datetime.datetime(2026, 1, 1) + \
+                datetime.timedelta(seconds=i)
+            obj.save()
+            objects.append(obj)
+        return source, objects
+
+    def test_quota_is_shared_alternating_between_sources(self):
+        # A big backlog (e.g. a first full inventory) and an urgent
+        # small update from another source
+        big_source, big_objects = self._make_source_with_objects(3)
+        small_source, small_objects = self._make_source_with_objects(2)
+
+        # The source with the lowest id is served first
+        first_objects, second_objects = sorted(
+            [big_objects, small_objects],
+            key=lambda objects: objects[0].harvest_source_id)
+
+        sent = queue.send_waiting_objects_to_fetch_queue(max_objects=4)
+
+        # The quota alternates between the sources, keeping each
+        # source's own object order
+        assert sent == [
+            first_objects[0].id, second_objects[0].id,
+            first_objects[1].id, second_objects[1].id,
+        ]
+        assert self._fetch_queue_object_ids() == sent
+
+        # The rest of the backlog was not sent and is not marked
+        model.Session.refresh(big_objects[2])
+        assert big_objects[2].fetch_queued is None
+        assert big_objects[2].state == 'WAITING'
+
+        # The next batch sends what is left of the backlog
+        sent = queue.send_waiting_objects_to_fetch_queue(max_objects=4)
+        assert sent == [big_objects[2].id]
+
+    def test_batches_continue_rotation_where_they_stopped(self):
+        objects = {}
+        for _ in range(3):
+            source, source_objects = self._make_source_with_objects(2)
+            objects[source.id] = source_objects
+        s1, s2, s3 = sorted(objects)
+
+        batch1 = queue.send_waiting_objects_to_fetch_queue(max_objects=2)
+        assert batch1 == [objects[s1][0].id, objects[s2][0].id]
+
+        # The next batch continues after the last source served, it
+        # does not start again from the first one
+        batch2 = queue.send_waiting_objects_to_fetch_queue(max_objects=2)
+        assert batch2 == [objects[s3][0].id, objects[s1][1].id]
+
+        batch3 = queue.send_waiting_objects_to_fetch_queue(max_objects=2)
+        assert batch3 == [objects[s2][1].id, objects[s3][1].id]
+
+        assert queue.send_waiting_objects_to_fetch_queue(max_objects=2) == []
+        assert self._fetch_queue_object_ids() == batch1 + batch2 + batch3
+
+    def test_rerun_after_failure_only_sends_what_is_left(self):
+        source, objects = self._make_source_with_objects(4)
+
+        # Fail the batch after the first object was dispatched
+        failing_publisher = Mock()
+        failing_publisher.send.side_effect = [None, Exception('boom')]
+        with patch.object(queue, 'get_fetch_publisher',
+                          return_value=failing_publisher):
+            with pytest.raises(Exception):
+                queue.send_waiting_objects_to_fetch_queue(max_objects=4)
+
+        # The dispatched object stays marked; the one that failed to
+        # send was released so that it can be sent again
+        for obj, dispatched in zip(objects, [True, False, False, False]):
+            model.Session.refresh(obj)
+            assert (obj.fetch_queued is not None) == dispatched
+
+        # Re-running the same batch recognizes the object that was
+        # already dispatched and does not send it again
+        sent = queue.send_waiting_objects_to_fetch_queue(max_objects=4)
+        assert sent == [obj.id for obj in objects[1:]]
+        assert self._fetch_queue_object_ids() == [obj.id for obj in objects[1:]]
+
+    def test_no_quota_limit(self):
+        source, objects = self._make_source_with_objects(3)
+
+        sent = queue.send_waiting_objects_to_fetch_queue(max_objects=0)
+
+        assert sent == [obj.id for obj in objects]
+        assert self._fetch_queue_object_ids() == sent
+
+    @pytest.mark.ckan_config('ckan.harvest.fetch_queue.max_objects_per_batch', 2)
+    def test_quota_defaults_to_config_option(self):
+        source, objects = self._make_source_with_objects(3)
+
+        sent = queue.send_waiting_objects_to_fetch_queue()
+
+        assert sent == [obj.id for obj in objects[:2]]
 
 
 class TestHarvestCorruptRedis(object):
