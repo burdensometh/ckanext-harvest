@@ -323,6 +323,15 @@ class TestCkanHarvester(object):
                 config=json.dumps(config))
         assert 'default_extras must be a dictionary' in str(harvest_context.value)
 
+    def test_merge_fields_invalid(self):
+        config = {'merge_fields': 'notes tags'}  # should be a list
+        with pytest.raises(toolkit.ValidationError) as harvest_context:
+            run_harvest(
+                url='http://localhost:%s' % mock_ckan.PORT,
+                harvester=CKANHarvester(),
+                config=json.dumps(config))
+        assert 'merge_fields must be a list of field names' in str(harvest_context.value)
+
     @patch('ckanext.harvest.harvesters.ckanharvester.CKANHarvester.config')
     @patch('ckanext.harvest.harvesters.ckanharvester.requests.get', side_effect=RequestException('Test.value'))
     def test_get_content_handles_request_exception(

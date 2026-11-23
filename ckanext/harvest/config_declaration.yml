@@ -111,6 +111,20 @@ groups:
           datasets, or alter them after they have been harvested.
         example: description tags
 
+      - key: ckan.harvest.merge_fields
+        type: list
+        default: notes tags
+        description: |
+          Dataset fields that catalogers are allowed to maintain by hand. On
+          every import the harvester performs a three-way merge between the
+          upstream content used for the last successful import, the current
+          local record and the freshly harvested upstream content. For the
+          fields listed here the local value wins when both sides changed it;
+          for every other field the upstream value wins. Conflicts (fields
+          changed by both sides) are stored on the harvest object under the
+          `merge_conflicts` extra so they can be reviewed.
+        example: notes tags description
+
       - key: ckan.harvest.harvest_source_limit
         type: int
         default: 100

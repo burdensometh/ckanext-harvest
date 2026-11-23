@@ -145,6 +145,13 @@ class CKANHarvester(HarvesterBase):
                 if not isinstance(config_obj['default_extras'], dict):
                     raise ValueError('default_extras must be a dictionary')
 
+            if 'merge_fields' in config_obj:
+                if not isinstance(config_obj['merge_fields'], list) or \
+                        not all(isinstance(field, str)
+                                for field in config_obj['merge_fields']):
+                    raise ValueError('merge_fields must be a list of field '
+                                     'names (i.e. strings)')
+
             if 'organizations_filter_include' in config_obj \
                     and 'organizations_filter_exclude' in config_obj:
                 raise ValueError('Harvest configuration cannot contain both '

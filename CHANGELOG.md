@@ -2,6 +2,12 @@
 
 ## [Unreleased](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...HEAD)
 
+* Three-way field merge when updating harvested datasets: cataloger edits to
+  the fields listed in `ckan.harvest.merge_fields` (defaults to the description
+  and tags) win over upstream changes, conflicts changed by both sides are
+  recorded on the harvest object (`merge_conflicts` extra), and re-harvesting
+  an unchanged upstream version preserves the merged result.
+
 ## [v1.6.3](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...v1.6.3) - 2026-08-12
 
 * The extension can now be installed via `pip install ckanext-harvest`: included requirements in pyproject.toml. To use the RabbitMQ backend, use `pip install ckanext-harvest[amqp]`.

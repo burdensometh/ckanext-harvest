@@ -234,6 +234,52 @@ For example, in case you want to retain changes made by the users to the fields 
     ckan.harvest.not_overwrite_fields = description tags
 
 
+Merging local edits with upstream changes (optional)
+====================================================
+
+Catalogers often need to rewrite the description of an imported dataset or
+adjust its tags, while the upstream source keeps updating other metadata such
+as licenses and resources. To support this, the harvester performs a
+three-way merge every time it updates an existing dataset:
+
+* **base** - the upstream content used for the last successful import
+* **local** - the dataset currently stored on this CKAN site
+* **upstream** - the freshly harvested content
+
+For each field the merge decides:
+
+* the local value is kept if only the local record changed it (a cataloger
+  edit that upstream has not touched);
+* the upstream value is used if only upstream changed it;
+* if both sides changed the field, the local value wins for the fields listed
+  in ``ckan.harvest.merge_fields`` and the upstream value wins for all other
+  fields.
+
+The fields that may be maintained by hand default to the description
+(``notes``) and ``tags``. You can change them globally::
+
+    ckan.harvest.merge_fields = notes tags
+
+or per harvest source, using the ``merge_fields`` key in the source config::
+
+    {"merge_fields": ["notes", "tags", "author"]}
+
+Extras are merged key by key, so catalogers can also maintain a specific extra
+field by listing it in ``merge_fields`` (e.g. ``author`` for the ``author``
+extra).
+
+Fields that were changed by both sides are recorded on the harvest object
+under the ``merge_conflicts`` extra, containing the field name, the base,
+local and upstream values and the chosen resolution. They can be reviewed
+with the ``harvest_object_show`` action::
+
+    GET /api/3/action/harvest_object_show?id=<harvest_object_id>
+
+Harvesting the same upstream version again is a no-op: the dataset is reported
+as ``not modified`` and the result of the previous merge, including any manual
+edits, is preserved.
+
+
 Command line interface
 ======================
 
