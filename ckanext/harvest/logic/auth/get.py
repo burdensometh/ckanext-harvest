@@ -53,6 +53,17 @@ def harvest_source_show_status(context, data_dict):
 
 
 @auth_allow_anonymous_access
+def harvest_source_catalog_at(context, data_dict):
+    '''
+        Authorization check for getting the catalog of a harvest source
+        reconstructed at a given moment
+
+        It forwards the checks to harvest_source_show.
+    '''
+    return harvest_source_show(context, data_dict)
+
+
+@auth_allow_anonymous_access
 def harvest_source_list(context, data_dict):
     '''
         Authorization check for getting a list of harveste sources

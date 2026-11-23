@@ -910,6 +910,38 @@ An optional query param `organization_id` can be used to narrow down the
 results to only return the harvest sources created by certain organization's by
 supplying their respective organization id -> `/api/action/harvest_source_list?organization_id=<some-org-id>`
 
+* `/api/action/harvest_source_catalog_at`
+
+This endpoint rebuilds the catalog of a harvest source as it was at a given
+moment, e.g. to answer "which records of this source were already available
+when a report was produced on a given day?". It replays the source's job
+history and the harvest object states up to (and including) the requested
+timestamp::
+
+    $ curl {ckan_url}/api/3/action/harvest_source_catalog_at?id=<source-id>&at=2024-03-02T00:00:00
+
+Each entry of ``results`` corresponds to one GUID known to the source at that
+moment and is classified as:
+
+* ``available``: the record had been successfully published by then. The entry
+  carries the local dataset id (``package_id``) and the version that was in
+  effect (``harvest_object_id``).
+* ``pending``: the record was already gathered but no import had finished
+  successfully by then (still in flight or only failed so far).
+* ``withdrawn``: the last successful import by then had marked the record as
+  deleted (``report_status`` = "deleted").
+
+Jobs of the source whose results were not final at the requested moment
+(still running, finished later, or aborted) are reported explicitly under
+``gaps``, together with the job ``coverage`` window around the snapshot.
+
+Results are sorted by GUID and can be paged with ``limit`` and ``offset``
+(an optional ``status`` parameter filters entries by their classification).
+The response echoes the effective parameters and includes a ``result_hash``
+computed over the full result set, so separate page requests can be
+cross-checked against each other and against later re-runs. All timestamps
+are UTC.
+
 
 Releases
 ========
