@@ -83,6 +83,10 @@ def harvest_job_dictize(job, context):
 
 def harvest_object_dictize(obj, context):
     out = obj.as_dict()
+    # Claim bookkeeping is internal to the fetch workers, not part of the
+    # public harvest object representation.
+    out.pop('claim_token', None)
+    out.pop('claim_expires', None)
     out['source'] = obj.harvest_source_id
     out['job'] = obj.harvest_job_id
 

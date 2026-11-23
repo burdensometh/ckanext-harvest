@@ -81,6 +81,20 @@ There are a number of configuration options available for the backends. These do
     - ``ckan.harvest.mq.port`` (5672)
     - ``ckan.harvest.mq.virtual_host`` (/)
 
+* Fetch claims (both backends):
+    - ``ckan.harvest.fetch_claim_timeout`` (600)
+
+The fetch queue is *at-least-once*: the same object message can be delivered
+more than once (for example after a consumer reconnect, or when a resubmitted
+object is already queued). Before running the fetch/import stages a worker
+atomically claims the object, so only one worker processes it at a time, and a
+message for an object that is already ``COMPLETE`` or ``ERROR`` is simply
+acknowledged. The claim is a lease renewed in the background while the worker
+runs; if the worker dies, the lease expires and another worker takes the object
+over. Result writes are fenced on the claim, so a worker whose lease expired can
+not overwrite the results of the worker that took over. The lease length is
+controlled by ``ckan.harvest.fetch_claim_timeout`` (seconds).
+
 
 **Note**: it is safe to use the same backend server (either Redis or RabbitMQ)
 for different CKAN instances, as long as they have different site ids. The ``ckan.site_id``

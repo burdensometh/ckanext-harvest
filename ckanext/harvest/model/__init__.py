@@ -6,7 +6,9 @@ from sqlalchemy import Column
 from sqlalchemy import ForeignKey
 from sqlalchemy import types
 from sqlalchemy import Index
+from sqlalchemy import or_
 from sqlalchemy.orm import backref, relationship
+from sqlalchemy.orm.attributes import set_committed_value
 from sqlalchemy.exc import InvalidRequestError
 
 from ckan.model.meta import Session
@@ -228,6 +230,13 @@ class HarvestObject(BaseModel, HarvestDomainObject):
     )
     # report_status: 'added', 'updated', 'not modified', 'deleted', 'errored'
     report_status = Column(types.UnicodeText, nullable=True)
+    # Fetch claims make sure a single worker processes a given object even if
+    # the same message is delivered more than once (e.g. redelivery after a
+    # reconnect, or two workers popping the same message). ``claim_token``
+    # identifies the worker holding the object, ``claim_expires`` is the
+    # instant after which another worker may take the object over.
+    claim_token = Column(types.UnicodeText, nullable=True)
+    claim_expires = Column(types.DateTime, nullable=True)
     harvest_job_id_idx = Index("harvest_job_id")
     harvest_source_id_idx = Index("harvest_source_id")
     package_id_idx = Index("package_id")
@@ -247,6 +256,163 @@ class HarvestObject(BaseModel, HarvestDomainObject):
         lazy="select",
         backref="objects",
     )
+
+    # -- Fetch claims -----------------------------------------------------
+    #
+    # The fetch queue is at-least-once: a message can be delivered twice (a
+    # consumer reconnecting may get the same message again, or a resubmit can
+    # enqueue an id that is already queued) and two workers can end up with
+    # the same object. To make sure a single worker processes an object at a
+    # time, a worker claims it before running the fetch/import stages.
+    #
+    # The claim is a lease: ``claim_token`` identifies the worker and
+    # ``claim_expires`` is the instant after which the object may be taken
+    # over by another worker. The holder renews the lease while it works, so a
+    # dead consumer's objects are recoverable once the lease expires.
+    #
+    # Result fields are written with a *fenced* update that only succeeds while
+    # ``claim_token`` still matches, so a slow worker whose lease expired (and
+    # whose object was taken over) cannot overwrite the new holder's result.
+
+    @classmethod
+    def claim_for(cls, object_id, token, timeout):
+        """Atomically try to acquire (or renew) the claim on ``object_id``.
+
+        The single ``UPDATE ... WHERE`` statement is the atomic step: only one
+        of any number of concurrent callers can move an unclaimed or expired
+        object to its own token. On PostgreSQL the concurrent updater blocks
+        until the winner commits, then re-evaluates the predicate against the
+        committed row and matches nothing.
+
+        :param object_id: id of the harvest object to claim.
+        :param token: unique string identifying the claiming worker/task.
+        :param timeout: lease length in seconds.
+        :returns: ``True`` if the claim is now held by ``token``.
+        """
+        now = datetime.datetime.utcnow()
+        expires = now + datetime.timedelta(seconds=timeout)
+        table = cls.__table__
+        stmt = (
+            table.update()
+            .where(table.c.id == object_id)
+            .where(
+                or_(
+                    table.c.claim_token.is_(None),
+                    table.c.claim_expires.is_(None),
+                    table.c.claim_expires <= now,
+                    table.c.claim_token == token,
+                )
+            )
+            .values(claim_token=token, claim_expires=expires)
+            .execution_options(synchronize_session=False)
+        )
+        return cls._run_fenced(stmt)
+
+    @classmethod
+    def renew_claim_for(cls, object_id, token, timeout):
+        """Extend the lease, but only if ``token`` still holds it.
+
+        Unlike :meth:`claim_for`, an expired claim held by *another* token is
+        not taken over here. This doubles as an ownership check made
+        immediately before a worker writes anything.
+        """
+        expires = datetime.datetime.utcnow() + datetime.timedelta(
+            seconds=timeout
+        )
+        table = cls.__table__
+        stmt = (
+            table.update()
+            .where(table.c.id == object_id)
+            .where(table.c.claim_token == token)
+            .values(claim_expires=expires)
+            .execution_options(synchronize_session=False)
+        )
+        return cls._run_fenced(stmt)
+
+    @classmethod
+    def release_claim_for(cls, object_id, token):
+        """Drop the claim, but only if it is still held by ``token``."""
+        table = cls.__table__
+        stmt = (
+            table.update()
+            .where(table.c.id == object_id)
+            .where(table.c.claim_token == token)
+            .values(claim_token=None, claim_expires=None)
+            .execution_options(synchronize_session=False)
+        )
+        return cls._run_fenced(stmt)
+
+    @classmethod
+    def save_claim_guarded_for(cls, object_id, token, **values):
+        """Write ``values`` only while ``token`` still holds the claim.
+
+        This is a compare-and-set on the claim token. When the lease was lost
+        (the object was taken over by another worker) the update matches zero
+        rows; the transaction is rolled back so that any pending changes made
+        by this (now stale) worker are discarded, instead of being flushed and
+        overwriting the current holder's result.
+
+        :returns: ``True`` if the values were written.
+        """
+        table = cls.__table__
+        stmt = (
+            table.update()
+            .where(table.c.id == object_id)
+            .where(table.c.claim_token == token)
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        return cls._run_fenced(stmt)
+
+    @classmethod
+    def _run_fenced(cls, stmt, values=None, instance=None):
+        """Run a claim update and commit only if it matched a single row.
+
+        A multi-worker race on a row is serialised by the database; the loser
+        sees ``rowcount == 0`` and rolls back rather than committing work it
+        no longer owns.
+
+        When ``instance`` and ``values`` are given the instance's attributes
+        are updated in memory only *after* a successful write, using
+        ``set_committed_value`` so the ORM never treats them as pending changes
+        (which a later commit could flush as an unguarded UPDATE).
+        """
+        result = Session.execute(stmt)
+        matched = result.rowcount == 1
+        if matched:
+            Session.commit()
+            if instance is not None and values:
+                for key, value in values.items():
+                    try:
+                        set_committed_value(instance, key, value)
+                    except Exception:  # pragma: no cover - detached
+                        pass
+        else:
+            Session.rollback()
+        return matched
+
+    # Instance-level convenience wrappers. They operate on ``self.id``. The
+    # guarded write also updates ``self`` (as committed values) on success.
+
+    def claim(self, token, timeout):
+        return self.claim_for(self.id, token, timeout)
+
+    def renew_claim(self, token, timeout):
+        return self.renew_claim_for(self.id, token, timeout)
+
+    def release_claim(self, token):
+        return self.release_claim_for(self.id, token)
+
+    def save_claim_guarded(self, token, **values):
+        table = self.__table__
+        stmt = (
+            table.update()
+            .where(table.c.id == self.id)
+            .where(table.c.claim_token == token)
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        return self._run_fenced(stmt, values=values, instance=self)
 
 
 class HarvestObjectExtra(BaseModel, HarvestDomainObject):

@@ -43,6 +43,16 @@ groups:
         description: |
           Database number used on the backend server (Redis only).
 
+      - key: ckan.harvest.fetch_claim_timeout
+        type: int
+        default: 600
+        description: |
+          Lease length, in seconds, for the claim a fetch worker takes on a
+          harvest object. While processing an object the worker renews the
+          claim from a background thread (every third of this value); if the
+          worker dies, the object becomes available to another worker once the
+          lease expires. This bounds how long a crashed fetch blocks an object.
+
   - annotation: Database logger settings
     options:
 

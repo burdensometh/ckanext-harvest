@@ -1,6 +1,8 @@
 import logging
 import datetime
 import json
+import threading
+import uuid
 
 
 import redis
@@ -36,6 +38,18 @@ REDIS_DB = 0
 # settings for AMQP
 EXCHANGE_TYPE = 'direct'
 EXCHANGE_NAME = 'ckan.harvest'
+
+# Fetch object claims
+#
+# A harvest object is processed by a single worker at a time. The worker claims
+# the object for a limited period and renews the claim from a background thread
+# while it runs the fetch/import stages. If the worker dies, the lease expires
+# and another worker can take the object over.
+DEFAULT_CLAIM_TIMEOUT = 10 * 60  # seconds
+
+# States from which an object will not be processed again. A duplicate delivery
+# for an object in one of these states is acknowledged without doing any work.
+TERMINAL_OBJECT_STATES = ('COMPLETE', 'ERROR')
 
 
 def get_connection():
@@ -116,6 +130,98 @@ def get_fetch_routing_key():
         config.get('ckan.site_id', 'default'))
 
 
+def get_claim_timeout():
+    '''Lease length (in seconds) for a fetch claim on a harvest object.
+
+    Configurable with ``ckan.harvest.fetch_claim_timeout``. A long default is
+    used so that a slow but healthy worker is not taken over; it only needs to
+    be greater than the interval at which the worker renews its claim.
+    '''
+    try:
+        return int(config.get('ckan.harvest.fetch_claim_timeout',
+                              DEFAULT_CLAIM_TIMEOUT))
+    except (TypeError, ValueError):
+        return DEFAULT_CLAIM_TIMEOUT
+
+
+def make_claim_token():
+    '''Return a fresh token identifying one fetch worker/task.'''
+    return uuid.uuid4().hex
+
+
+def get_live_claim_object_ids(object_ids):
+    '''Return the subset of ``object_ids`` that currently hold a live claim.
+
+    Used to avoid re-enqueuing objects that a healthy worker is still busy
+    with. A claim is live while ``claim_expires`` is in the future.
+    '''
+    if not object_ids:
+        return set()
+    now = datetime.datetime.utcnow()
+    rows = model.Session.query(HarvestObject.id).filter(
+        HarvestObject.id.in_(list(object_ids)),
+        HarvestObject.claim_token.isnot(None),
+        HarvestObject.claim_expires.isnot(None),
+        HarvestObject.claim_expires > now,
+    ).all()
+    return {row[0] for row in rows}
+
+
+class ClaimHeartbeat(object):
+    '''Keep a fetch claim alive while its holder is still working.
+
+    A worker renews its lease from a background thread so that long-running
+    fetch/import stages are not mistaken for a dead worker. Takeover then only
+    happens when the holder has genuinely stopped renewing (i.e. it died),
+    which is exactly the distinction between "slow" and "gone" that makes
+    lease takeover reliable.
+    '''
+
+    def __init__(self, object_id, token, timeout):
+        self.object_id = object_id
+        self.token = token
+        self.timeout = timeout
+        # Renew well before expiry so a single slow renewal does not let the
+        # lease lapse while the holder is still alive.
+        self.interval = max(1, timeout // 3)
+        self._stop = threading.Event()
+        self._thread = None
+        self.lost = False
+
+    def _run(self):
+        # This runs on a separate thread. CKAN's session is a scoped (per
+        # thread) session, so ``HarvestObject.renew_claim_for`` transparently
+        # uses this thread's own session and never the worker's.
+        while not self._stop.wait(self.interval):
+            try:
+                renewed = HarvestObject.renew_claim_for(
+                    self.object_id, self.token, self.timeout)
+            except Exception:
+                log.exception('Error renewing claim on harvest object %s',
+                              self.object_id)
+                model.Session.remove()
+                continue
+            model.Session.remove()
+            if not renewed:
+                # Someone else took the object over; stop trying to hold it.
+                self.lost = True
+                log.warning('Lost claim on harvest object %s (lease expired)',
+                            self.object_id)
+                return
+
+    def __enter__(self):
+        self._thread = threading.Thread(
+            target=self._run, name='harvest-claim-heartbeat', daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        return False
+
+
 def purge_queues():
     backend = config.get('ckan.harvest.mq.type', MQ_TYPE)
     connection = get_connection()
@@ -154,9 +260,18 @@ def resubmit_jobs():
         log.debug('[Fetch queue]: Check key {} with value {}'.format(key, date_of_key))
         # 3 minutes for fetch and import max
         if (datetime.datetime.now() - date_of_key).seconds > 180:
+            object_id = key.split(':')[-1]
+            # Do not re-enqueue an object a live worker is still processing:
+            # resubmitting it would create a duplicate delivery. The claim
+            # lease is renewed by the worker, so a genuinely stuck worker is
+            # handled by the normal takeover once its lease expires.
+            if get_live_claim_object_ids([object_id]):
+                log.debug('[Fetch queue]: Object {} is still claimed, '
+                          'not resubmitting', object_id)
+                continue
             log.debug('[Fetch queue]: Re-new harvest object with KEY {} in redis'.format(key))
             redis.rpush(get_fetch_routing_key(),
-                        json.dumps({'harvest_object_id': key.split(':')[-1]})
+                        json.dumps({'harvest_object_id': object_id})
                         )
             redis.delete(key)
 
@@ -198,10 +313,19 @@ def resubmit_objects():
     objects_in_queue = [json.loads(o)['harvest_object_id']
                         for o in redis.lrange(fetch_routing_key, 0, -1)]
 
-    for object_id, in waiting_objects:
-        if object_id not in objects_in_queue:
-            log.debug('Re-sent object {} to the fetch queue'.format(object_id))
-            publisher.send({'harvest_object_id': object_id})
+    waiting_ids = [object_id for object_id, in waiting_objects
+                   if object_id not in objects_in_queue]
+    # Skip objects a live worker is currently processing: re-enqueuing them
+    # would only produce duplicate deliveries that the claim would reject.
+    claimed_ids = get_live_claim_object_ids(waiting_ids)
+
+    for object_id in waiting_ids:
+        if object_id in claimed_ids:
+            log.debug('Object {} is still claimed, not resubmitting',
+                      object_id)
+            continue
+        log.debug('Re-sent object {} to the fetch queue'.format(object_id))
+        publisher.send({'harvest_object_id': object_id})
 
     publisher.close()
 
@@ -461,9 +585,10 @@ def fetch_callback(channel, method, header, body):
     try:
         id = json.loads(body)['harvest_object_id']
         log.info('Received harvest object id: %s' % id)
-    except KeyError:
+    except (KeyError, TypeError, ValueError):
         log.error('No harvest object id received')
-        channel.basic_ack(method.delivery_tag)
+        if method.delivery_tag is not None:
+            channel.basic_ack(method.delivery_tag)
         return False
 
     try:
@@ -482,82 +607,202 @@ def fetch_callback(channel, method, header, body):
         channel.basic_ack(method.delivery_tag)
         return False
 
-    obj.retry_times += 1
-    obj.save()
-
-    if obj.retry_times >= 5:
-        obj.state = "ERROR"
-        obj.save()
-        log.error('Too many consecutive retries for object {0}'.format(obj.id))
+    # Duplicate deliveries: the same message can arrive more than once (e.g. a
+    # resubmit re-enqueued an id that was already queued, or a reconnect
+    # redelivered an in-flight message). If the object has already reached a
+    # terminal state, acknowledge the message without touching the object.
+    if obj.state in TERMINAL_OBJECT_STATES:
+        log.info('Harvest object %s already finished (state=%s); '
+                 'acknowledging duplicate message', id, obj.state)
+        model.Session.remove()
         channel.basic_ack(method.delivery_tag)
         return False
+
+    claim_timeout = get_claim_timeout()
+    token = make_claim_token()
+
+    try:
+        claimed = obj.claim(token, claim_timeout)
+    except sqlalchemy.exc.DatabaseError:
+        log.exception('Connection error claiming harvest object %s', id)
+        model.Session.remove()
+        # Without an ack the message will be retried later.
+        return
+
+    if not claimed:
+        # Another worker holds a live claim on this object. Leave the message
+        # unacknowledged: for Redis this keeps the in-flight marker so a
+        # takeover can happen if the holder dies, and for AMQP the broker will
+        # redeliver it. Claiming again later will either succeed (the previous
+        # holder finished and released, or its lease expired) or be rejected
+        # while the holder is still alive.
+        log.info('Harvest object %s is already claimed by another worker; '
+                 'not processing this delivery', id)
+        model.Session.remove()
+        return False
+
+    try:
+        # Re-read the object now that we hold the claim: its state may have
+        # changed since the terminal-state check above (another worker may have
+        # completed it between our check and acquiring the now-free claim).
+        obj = HarvestObject.get(id)
+        if obj is None:
+            log.error('Harvest object does not exist: %s' % id)
+            channel.basic_ack(method.delivery_tag)
+            return False
+        if obj.state in TERMINAL_OBJECT_STATES:
+            log.info('Harvest object %s already finished (state=%s); '
+                     'acknowledging duplicate message', id, obj.state)
+            channel.basic_ack(method.delivery_tag)
+            return False
+
+        finished = process_claimed_object(obj, token)
+    except sqlalchemy.exc.DatabaseError:
+        log.exception('Connection Error during fetch of job %s', id)
+        # Leave the message unacknowledged so it is retried. The claim is
+        # released in the ``finally`` block below.
+        finished = False
+    finally:
+        # Only release a claim we still own; a worker that took the object over
+        # after our lease expired owns it now.
+        try:
+            HarvestObject.release_claim_for(id, token)
+        except Exception:
+            log.exception('Error releasing claim on harvest object %s', id)
+        model.Session.remove()
+
+    if finished:
+        channel.basic_ack(method.delivery_tag)
+    # Otherwise (the claim was lost mid-processing) leave the message
+    # unacknowledged so it can be redelivered / taken over.
+    return finished
+
+
+def process_claimed_object(obj, token):
+    '''Run the fetch/import stages for an object we hold the claim on.
+
+    All state writes are fenced on ``token`` so a worker whose lease expired
+    can not overwrite the results of the worker that took the object over.
+
+    Returns ``True`` when the object reached a final state (or was deliberately
+    left untouched), ``False`` when the claim was lost.
+    '''
+    # Count the attempt only now that we hold the claim: duplicate deliveries
+    # that could not claim never reach this point, so they can not inflate the
+    # retry count and push an object into ERROR.
+    retry_times = (obj.retry_times or 0) + 1
+    if not obj.save_claim_guarded(token, retry_times=retry_times):
+        log.warning('Lost claim on harvest object %s before processing', obj.id)
+        return False
+
+    if retry_times >= 5:
+        if not obj.save_claim_guarded(token, state="ERROR"):
+            return False
+        log.error('Too many consecutive retries for object {0}'.format(obj.id))
+        return True
 
     # check if job has been set to finished
     job = HarvestJob.get(obj.harvest_job_id)
-    if job.status == 'Finished':
-        obj.state = "ERROR"
-        obj.report_status = "errored"
-        obj.save()
-        log.error('Job {0} was aborted or timed out, object {1} set to error'.format(job.id, obj.id))
-        channel.basic_ack(method.delivery_tag)
-        return False
+    if job is not None and job.status == 'Finished':
+        if not obj.save_claim_guarded(
+                token, state="ERROR", report_status="errored"):
+            return False
+        log.error('Job {0} was aborted or timed out, object {1} set to error'
+                  .format(job.id, obj.id))
+        return True
 
     # Send the harvest object to the plugins that implement
     # the Harvester interface, only if the source type
-    # matches
-    for harvester in PluginImplementations(IHarvester):
-        if harvester.info()['name'] == obj.source.type:
-            fetch_and_import_stages(harvester, obj)
+    # matches. Keep the lease alive from a background thread so a long but
+    # healthy fetch/import is not mistaken for a dead worker.
+    with ClaimHeartbeat(obj.id, token, get_claim_timeout()):
+        for harvester in PluginImplementations(IHarvester):
+            if harvester.info()['name'] == obj.source.type:
+                if not fetch_and_import_stages(harvester, obj, token=token):
+                    return False
+    return True
 
-    model.Session.remove()
-    channel.basic_ack(method.delivery_tag)
 
+def fetch_and_import_stages(harvester, obj, token=None):
+    '''Run ``fetch_stage`` and, if successful, ``import_stage`` for ``obj``.
 
-def fetch_and_import_stages(harvester, obj):
-    obj.fetch_started = datetime.datetime.utcnow()
-    obj.state = "FETCH"
-    obj.save()
+    When ``token`` is given the object is being processed under a fetch claim.
+    The claim is renewed at each stage boundary and every write is fenced on
+    the token, so a worker that lost its lease (because it took too long and
+    the object was taken over) discards its result instead of overwriting the
+    new holder's. ``token=None`` keeps the historical behaviour for callers
+    that run the stages directly (tests, ``harvester run-test``).
+    '''
+    claim_timeout = get_claim_timeout()
+
+    def renew():
+        if token is None:
+            return True
+        return obj.renew_claim(token, claim_timeout)
+
+    def save(**values):
+        if token is None:
+            for key, value in values.items():
+                setattr(obj, key, value)
+            obj.save()
+            return True
+        # In fenced mode the write is a bare UPDATE (compare-and-set on the
+        # claim token), not an ORM flush, so the guard - not the ORM - decides
+        # whether the row is written. ``obj`` is kept in sync only after a
+        # successful write, and then as committed values so nothing is left
+        # pending for a later commit to flush unguarded.
+        return obj.save_claim_guarded(token, **values)
+
+    if not renew():
+        return False
+    if not save(fetch_started=datetime.datetime.utcnow(), state="FETCH"):
+        return False
+
     success_fetch = harvester.fetch_stage(obj)
-    obj.fetch_finished = datetime.datetime.utcnow()
-    obj.save()
+
+    if not renew():
+        return False
+    if not save(fetch_finished=datetime.datetime.utcnow()):
+        return False
+
     if success_fetch is True:
         # If no errors where found, call the import method
-        obj.import_started = datetime.datetime.utcnow()
-        obj.state = "IMPORT"
-        obj.save()
+        if not renew():
+            return False
+        if not save(import_started=datetime.datetime.utcnow(), state="IMPORT"):
+            return False
         success_import = harvester.import_stage(obj)
-        obj.import_finished = datetime.datetime.utcnow()
+        if not renew():
+            return False
+        if not save(import_finished=datetime.datetime.utcnow()):
+            return False
         if success_import:
-            obj.state = "COMPLETE"
-            if success_import == 'unchanged':
-                obj.report_status = 'not modified'
-                obj.save()
-                return
+            state = "COMPLETE"
+            report_status = "not modified" if success_import == 'unchanged' else None
         else:
-            obj.state = "ERROR"
-        obj.save()
+            state = "ERROR"
+            report_status = "errored"
     elif success_fetch == 'unchanged':
-        obj.state = 'COMPLETE'
-        obj.report_status = 'not modified'
-        obj.save()
-        return
+        state = "COMPLETE"
+        report_status = "not modified"
     else:
-        obj.state = "ERROR"
-        obj.save()
-    if obj.state == 'ERROR':
-        obj.report_status = 'errored'
-    elif obj.current is False:
-        obj.report_status = 'deleted'
-    elif len(
-        model.Session.query(HarvestObject)
-            .filter_by(package_id=obj.package_id)
-            .limit(2)
-            .all()
-    ) == 2:
-        obj.report_status = 'updated'
-    else:
-        obj.report_status = 'added'
-    obj.save()
+        state = "ERROR"
+        report_status = "errored"
+
+    if report_status is None:
+        if obj.current is False:
+            report_status = "deleted"
+        elif len(
+            model.Session.query(HarvestObject)
+                .filter_by(package_id=obj.package_id)
+                .limit(2)
+                .all()
+        ) == 2:
+            report_status = "updated"
+        else:
+            report_status = "added"
+
+    return save(state=state, report_status=report_status)
 
 
 def get_gather_consumer():

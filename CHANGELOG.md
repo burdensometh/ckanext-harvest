@@ -2,6 +2,18 @@
 
 ## [Unreleased](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...HEAD)
 
+* Ensure each harvest object is processed by a single fetch worker. A worker
+  atomically claims an object before running the fetch/import stages, so
+  duplicate deliveries (e.g. after a reconnect or a resubmit) and two workers
+  racing on the same message no longer process the object twice. Messages for
+  objects that are already `COMPLETE` or `ERROR` are safely acknowledged.
+* Fetch claims are leases renewed in the background while a worker runs, so a
+  dead worker's objects are reliably taken over once the lease expires, while a
+  slow-but-alive worker keeps its object. Result writes are fenced on the claim,
+  so a stale worker whose lease expired can not overwrite the new holder's
+  result. The lease length is configurable via
+  `ckan.harvest.fetch_claim_timeout` (default 600 seconds).
+
 ## [v1.6.3](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...v1.6.3) - 2026-08-12
 
 * The extension can now be installed via `pip install ckanext-harvest`: included requirements in pyproject.toml. To use the RabbitMQ backend, use `pip install ckanext-harvest[amqp]`.
