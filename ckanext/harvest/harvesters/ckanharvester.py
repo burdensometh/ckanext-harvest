@@ -8,6 +8,7 @@ from urllib.parse import urlencode
 from ckan import model
 from ckan.logic import ValidationError, NotFound, get_action
 from ckan.lib.helpers import json
+from ckan.lib.munge import munge_tag
 from ckan.plugins import toolkit
 
 from ckanext.harvest.model import HarvestObject
@@ -118,6 +119,19 @@ class CKANHarvester(HarvesterBase):
                     raise ValueError('default_tags must be a list of '
                                      'dictionaries')
 
+            if 'tag_aliases' in config_obj:
+                if not isinstance(config_obj['tag_aliases'], dict):
+                    raise ValueError('tag_aliases must be a dictionary '
+                                     'mapping alias tag names to canonical '
+                                     'tag names')
+                # Raises ValueError if the mapping is ambiguous or invalid
+                self._normalize_tag_aliases(config_obj['tag_aliases'])
+
+            if 'tag_aliases_unmatched' in config_obj:
+                if config_obj['tag_aliases_unmatched'] not in ('keep', 'drop'):
+                    raise ValueError('tag_aliases_unmatched must be either '
+                                     '"keep" or "drop"')
+
             if 'default_groups' in config_obj:
                 if not isinstance(config_obj['default_groups'], list):
                     raise ValueError('default_groups must be a *list* of group'
@@ -173,6 +187,112 @@ class CKANHarvester(HarvesterBase):
             raise e
 
         return config
+
+    @staticmethod
+    def _normalize_tag_aliases(tag_aliases):
+        '''
+        Returns a dict of normalized alias -> canonical term for the given
+        `tag_aliases` config mapping. Aliases are normalized the same way
+        CKAN normalizes tag names on import (munge_tag), so differently
+        written variants of the same word match a single alias.
+
+        Raises ValueError if the mapping is invalid or ambiguous:
+
+        * aliases and canonical terms must be strings that normalize to a
+          usable tag name
+        * two aliases that normalize to the same tag name must not map to
+          different canonical terms
+        * a canonical term must not normalize to another alias (map the
+          alias directly to the final canonical term instead)
+        '''
+        # normalized alias -> (normalized canonical, alias, canonical)
+        normalized = {}
+        for alias, canonical in tag_aliases.items():
+            if not isinstance(alias, str) or not isinstance(canonical, str):
+                raise ValueError('tag_aliases must map strings to strings')
+            normalized_alias = munge_tag(alias)
+            normalized_canonical = munge_tag(canonical)
+            if not normalized_alias:
+                raise ValueError('tag_aliases alias %r does not normalize '
+                                 'to a valid tag name' % alias)
+            if not normalized_canonical:
+                raise ValueError('tag_aliases canonical term %r (alias %r) '
+                                 'does not normalize to a valid tag name'
+                                 % (canonical, alias))
+            existing = normalized.get(normalized_alias)
+            if existing:
+                if existing[0] != normalized_canonical:
+                    raise ValueError(
+                        'tag_aliases aliases %r and %r normalize to the '
+                        'same tag name but map to different canonical '
+                        'terms (%r and %r)'
+                        % (existing[1], alias, existing[2], canonical))
+            else:
+                normalized[normalized_alias] = \
+                    (normalized_canonical, alias, canonical)
+
+        for normalized_alias, value in normalized.items():
+            normalized_canonical, alias, canonical = value
+            target = normalized.get(normalized_canonical)
+            if target and target[0] != normalized_canonical:
+                raise ValueError(
+                    'tag_aliases canonical term %r (alias %r) is itself an '
+                    'alias for %r - map %r directly to the final canonical '
+                    'term' % (canonical, alias, target[2], alias))
+
+        return dict(
+            (normalized_alias, canonical)
+            for normalized_alias, (normalized_canonical, alias, canonical)
+            in normalized.items())
+
+    def _apply_tag_aliases(self, tags):
+        '''
+        Replaces alias tag names with their canonical terms (config option
+        `tag_aliases`) and removes duplicates: tags that normalize to the
+        same tag name are only kept once (first occurrence wins). Tags not
+        matched by the mapping are kept or dropped according to the
+        `tag_aliases_unmatched` config option ('keep' by default). Tags
+        belonging to a vocabulary are left untouched.
+        '''
+        aliases = self._normalize_tag_aliases(
+            self.config.get('tag_aliases', {}))
+        keep_unmatched = \
+            self.config.get('tag_aliases_unmatched', 'keep') == 'keep'
+
+        new_tags = []
+        seen = set()
+        for tag in tags:
+            if isinstance(tag, dict):
+                if tag.get('vocabulary_id'):
+                    # Tags belonging to a vocabulary are not touched
+                    new_tags.append(tag)
+                    continue
+                name = tag.get('name')
+            else:
+                name = tag
+            if not isinstance(name, str):
+                new_tags.append(tag)
+                continue
+            canonical = aliases.get(munge_tag(name))
+            if canonical is None:
+                if not keep_unmatched:
+                    continue
+                new_name = name
+            else:
+                new_name = canonical
+            normalized = munge_tag(new_name)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            if isinstance(tag, dict):
+                tag = dict(tag, name=new_name)
+                if new_name != name:
+                    # Drop the stale display name of the alias
+                    tag.pop('display_name', None)
+            else:
+                tag = new_name
+            new_tags.append(tag)
+        return new_tags
 
     def modify_package_dict(self, package_dict, harvest_object):
         '''
@@ -403,6 +523,13 @@ class CKANHarvester(HarvesterBase):
                     package_dict['tags'] = []
                 package_dict['tags'].extend(
                     [t for t in default_tags if t not in package_dict['tags']])
+
+            # Map alias subject terms to their canonical form and
+            # deduplicate tags that normalize to the same name
+            if self.config.get('tag_aliases') or \
+                    'tag_aliases_unmatched' in self.config:
+                package_dict['tags'] = self._apply_tag_aliases(
+                    package_dict.get('tags', []))
 
             remote_groups = self.config.get('remote_groups', None)
             if remote_groups not in ('only_local', 'create'):

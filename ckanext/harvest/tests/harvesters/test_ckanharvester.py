@@ -257,6 +257,126 @@ class TestCkanHarvester(object):
                 config=json.dumps(config))
         assert 'default_tags must be a list of dictionaries' in str(harvest_context.value)
 
+    def _run_harvest_with_dataset_tags(self, tags, config):
+        '''Runs a harvest with dataset1 carrying the given tags and returns
+        the results by guid.'''
+        datasets = copy.deepcopy(mock_ckan.DATASETS)
+        datasets[0]['tags'] = tags
+        with patch('ckanext.harvest.tests.harvesters.mock_ckan.DATASETS',
+                   datasets):
+            return run_harvest(
+                url='http://localhost:%s' % mock_ckan.PORT,
+                harvester=CKANHarvester(),
+                config=json.dumps(config))
+
+    def test_tag_aliases(self):
+        config = {
+            'tag_aliases': {
+                'Air Quality': 'air-quality',
+                'aq': 'air-quality',
+            }
+        }
+        results_by_guid = self._run_harvest_with_dataset_tags(
+            tags=[{'name': 'Air Quality'}, {'name': 'aq'},
+                  {'name': 'air-quality'}, {'name': 'other-tag'}],
+            config=config)
+
+        result = results_by_guid['dataset1-id']
+        assert result['errors'] == []
+        tag_names = [tag['name'] for tag in result['dataset']['tags']]
+        # The three variants of the same word are mapped to the canonical
+        # term and deduplicated, the unmatched tag is kept
+        assert sorted(tag_names) == ['air-quality', 'other-tag']
+
+    def test_tag_aliases_unmatched_drop(self):
+        config = {
+            'tag_aliases': {'aq': 'air-quality'},
+            'tag_aliases_unmatched': 'drop',
+        }
+        results_by_guid = self._run_harvest_with_dataset_tags(
+            tags=[{'name': 'aq'}, {'name': 'other-tag'}],
+            config=config)
+
+        result = results_by_guid['dataset1-id']
+        assert result['errors'] == []
+        tag_names = [tag['name'] for tag in result['dataset']['tags']]
+        assert tag_names == ['air-quality']
+
+    def test_tag_aliases_applied_after_default_tags(self):
+        config = {
+            'default_tags': [{'name': 'geo'}],
+            'tag_aliases': {'geo': 'geography', 'Geography': 'geography'},
+        }
+        results_by_guid = self._run_harvest_with_dataset_tags(
+            tags=[{'name': 'Geography'}],
+            config=config)
+
+        result = results_by_guid['dataset1-id']
+        assert result['errors'] == []
+        tag_names = [tag['name'] for tag in result['dataset']['tags']]
+        # The remote tag and the default tag both map to the canonical
+        # term, so only one tag is published
+        assert tag_names == ['geography']
+
+    def test_tag_aliases_vocabulary_tags_untouched(self):
+        harvester = CKANHarvester()
+        harvester.config = {
+            'tag_aliases': {'energy': 'power'},
+            'tag_aliases_unmatched': 'drop',
+        }
+        vocab_tag = {'name': 'energy', 'vocabulary_id': 'vocab-1'}
+        tags = harvester._apply_tag_aliases(
+            [vocab_tag, {'name': 'energy'}, {'name': 'other-tag'}])
+        # The vocabulary tag is left as is, the free tag is mapped and the
+        # unmatched one dropped
+        assert tags == [vocab_tag, {'name': 'power'}]
+
+    def test_tag_aliases_invalid_not_a_dict(self):
+        config = {'tag_aliases': ['geo']}
+        with pytest.raises(toolkit.ValidationError) as harvest_context:
+            run_harvest(
+                url='http://localhost:%s' % mock_ckan.PORT,
+                harvester=CKANHarvester(),
+                config=json.dumps(config))
+        assert 'tag_aliases must be a dictionary' in str(harvest_context.value)
+
+    def test_tag_aliases_ambiguous_after_normalization(self):
+        config = {
+            'tag_aliases': {
+                'Air Quality': 'air-quality',
+                'air quality': 'air-pollution',
+            }
+        }
+        with pytest.raises(toolkit.ValidationError) as harvest_context:
+            run_harvest(
+                url='http://localhost:%s' % mock_ckan.PORT,
+                harvester=CKANHarvester(),
+                config=json.dumps(config))
+        assert 'normalize to the same tag name' in str(harvest_context.value)
+
+    def test_tag_aliases_chained_canonical(self):
+        config = {
+            'tag_aliases': {
+                'aq': 'air-quality',
+                'air-quality': 'air-pollution',
+            }
+        }
+        with pytest.raises(toolkit.ValidationError) as harvest_context:
+            run_harvest(
+                url='http://localhost:%s' % mock_ckan.PORT,
+                harvester=CKANHarvester(),
+                config=json.dumps(config))
+        assert 'is itself an alias' in str(harvest_context.value)
+
+    def test_tag_aliases_unmatched_invalid(self):
+        config = {'tag_aliases_unmatched': 'discard'}
+        with pytest.raises(toolkit.ValidationError) as harvest_context:
+            run_harvest(
+                url='http://localhost:%s' % mock_ckan.PORT,
+                harvester=CKANHarvester(),
+                config=json.dumps(config))
+        assert 'tag_aliases_unmatched must be either' in str(harvest_context.value)
+
     def test_default_groups(self):
         Group(name='group1')
         Group(name='group2')

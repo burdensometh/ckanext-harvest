@@ -310,6 +310,23 @@ field. The currently supported configuration options are:
     Tags don't need to previously exist. This field takes a list of tag dicts
     (see example), which allows you to optinally specify a vocabulary.
 
+*   tag_aliases: A dictionary mapping alias tag names to canonical tag names,
+    e.g. ``{"air-pollution": "air-quality"}``. Different sources often use
+    different words for the same subject; use this option (per source) to
+    publish a single canonical term instead. The mapping is applied to the
+    harvested tags after default_tags have been merged in, and the resulting
+    tags are deduplicated: tags that normalize to the same tag name (same
+    letters, case, and separators, e.g. "Air Quality" and "air-quality") are
+    only kept once. Tags belonging to a vocabulary are left untouched. The
+    mapping is validated when the source is saved, so ambiguous mappings
+    (two aliases for the same word pointing to different canonical terms, or
+    a canonical term that is itself an alias) are rejected before anything
+    is imported.
+
+*   tag_aliases_unmatched: What to do with tags that don't match any alias
+    in tag_aliases: "keep" (the default) keeps them as they are, "drop"
+    removes them from the harvested datasets.
+
 *   default_groups: A list of group IDs or names to which the harvested datasets
     will be added to. The groups must exist.
 
@@ -395,6 +412,8 @@ the configuration field)::
     {
      "api_version": 1,
      "default_tags": [{"name": "geo"}, {"name": "namibia"}],
+     "tag_aliases": {"air-pollution": "air-quality", "aq": "air-quality"},
+     "tag_aliases_unmatched": "keep",
      "default_groups": ["science", "spend-data"],
      "default_extras": {"encoding":"utf8", "harvest_url": "{harvest_source_url}/dataset/{dataset_id}"},
      "override_extras": true,
