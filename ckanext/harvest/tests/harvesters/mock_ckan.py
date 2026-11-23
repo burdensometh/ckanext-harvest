@@ -196,9 +196,13 @@ def serve(port=PORT):
     class TestServer(TCPServer):
         allow_reuse_address = True
 
-    httpd = TestServer(("", PORT), MockCkanHandler)
+    try:
+        httpd = TestServer(("", port), MockCkanHandler)
+    except OSError:
+        # The server is already running (another test module started it).
+        return
 
-    print('Serving test HTTP server at port {}'.format(PORT))
+    print('Serving test HTTP server at port {}'.format(port))
 
     httpd_thread = Thread(target=httpd.serve_forever)
     httpd_thread.setDaemon(True)

@@ -28,6 +28,34 @@ def harvest_source_update(context, data_dict):
                 'msg': pt._('User {0} not authorized to update harvest source {1}').format(user, source_id)}
 
 
+def harvest_quarantine_replay(context, data_dict):
+    '''
+        Authorization check for replaying quarantined records
+
+        Only users who can update the relevant harvest source (i.e. catalogue
+        administrators) can replay records.  When replaying a single entry the
+        source is looked up from the entry.
+    '''
+    source_id = data_dict.get('source_id')
+    entry_id = data_dict.get('id')
+
+    if not source_id and entry_id:
+        from ckanext.harvest.model import HarvestQuarantine
+        entry = HarvestQuarantine.get(entry_id)
+        if not entry:
+            raise pt.ObjectNotFound(pt._('Quarantine entry not found'))
+        source_id = entry.harvest_source_id
+
+    if not source_id:
+        # Replaying everything is an administrative operation.
+        if not user_is_sysadmin(context):
+            return {'success': False,
+                    'msg': pt._('Only sysadmins can replay all quarantined records')}
+        return {'success': True}
+
+    return harvest_source_update(context, {'id': source_id})
+
+
 def harvest_sources_clear(context, data_dict):
     '''
         Authorization check for clearing history for all harvest sources

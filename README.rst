@@ -234,6 +234,65 @@ For example, in case you want to retain changes made by the users to the fields 
     ckan.harvest.not_overwrite_fields = description tags
 
 
+Field rules and quarantining non-compliant records (optional)
+=============================================================
+
+Data suppliers sometimes change the shape of their metadata (for example after
+upgrading their publishing form), and some records stop providing a usable
+title or one of the licences agreed with the source. Rather than letting those
+records overwrite good local datasets, or failing the whole harvest, the CKAN
+harvester can validate every record against *field rules* configured on the
+harvest source and set aside (quarantine) the records that do not comply. The
+remaining records are imported as usual.
+
+The rules are defined as JSON in the harvest source configuration (the same
+``config`` field used for the other options below)::
+
+    {
+        "field_rules": {
+            "required": ["title"],
+            "allowed": {
+                "license_id": ["cc-by", "uk-ogl"]
+            }
+        }
+    }
+
+* ``required``: fields that must be present and non-empty.
+* ``allowed``: fields that must be present and take one of the listed values.
+  For convenience ``allowed_licenses`` (a list of licence ids) can be used
+  instead of an explicit ``allowed`` entry for ``license_id``.
+
+The top-level keys ``required_fields``, ``allowed_field_values`` and
+``allowed_licenses`` are accepted as aliases, so a source can adopt the feature
+without nesting them under ``field_rules``.
+
+When a record does not comply:
+
+* it is **not** imported, so an existing local dataset keeps its previous
+  values untouched;
+* it does **not** count as an import error - it is reported with the
+  ``quarantined`` status and the rest of the job continues normally;
+* the original payload is stored together with the specific offending fields
+  and the reason for each one.
+
+A catalogue administrator can then correct the rules and replay the records:
+
+* from the command line::
+
+      ckan --config=/etc/ckan/default/ckan.ini harvester quarantine-list
+      ckan --config=/etc/ckan/default/ckan.ini harvester quarantine-list --source {source-id/name}
+      ckan --config=/etc/ckan/default/ckan.ini harvester quarantine-replay --source {source-id/name}
+      ckan --config=/etc/ckan/default/ckan.ini harvester quarantine-replay --id {quarantine-entry-id}
+
+* from the harvest source **Admin** page, which lists the quarantined records
+  with their field and reason.
+
+Replay only considers the records on the quarantine list, so datasets that
+were imported successfully by earlier harvests are left untouched. When a
+replayed record still does not comply, it stays in the list (as ``pending``)
+with the current reasons instead of being dropped.
+
+
 Command line interface
 ======================
 
@@ -261,6 +320,8 @@ Please refer to the help message of each command for more details::
      job-all            Create new harvest jobs for all active sources.
      jobs               Lists harvest jobs.
      purge-queues       Removes all jobs from fetch and gather queue.
+     quarantine-list    List records quarantined by the source field rules.
+     quarantine-replay  Replay quarantined records after correcting the rules.
      reindex            Reindexes the harvest source datasets.
      run                Starts any harvest jobs that have been created by...
      run-test           Runs a harvest - for testing only.

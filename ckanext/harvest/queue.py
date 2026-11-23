@@ -533,6 +533,14 @@ def fetch_and_import_stages(harvester, obj):
                 obj.report_status = 'not modified'
                 obj.save()
                 return
+            if success_import == 'quarantined':
+                # The record did not comply with the source field rules and
+                # has been set aside for the catalogue administrator.  It is
+                # not an import error: the job continues and other records
+                # are imported normally.
+                obj.report_status = 'quarantined'
+                obj.save()
+                return
         else:
             obj.state = "ERROR"
         obj.save()

@@ -15,4 +15,9 @@
       <p class="empty">{{ _('No jobs yet for this source') }}</p>
     {% endif %}
   </section>
+
+  {% set quarantine_entries = h.harvest_source_quarantine(harvest_source.id) %}
+  {% if quarantine_entries %}
+    {% snippet "snippets/quarantine_list.html", entries=quarantine_entries, harvest_source=harvest_source %}
+  {% endif %}
 {% endblock %}

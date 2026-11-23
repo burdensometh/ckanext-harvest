@@ -35,6 +35,12 @@ Example:
         {{ _(action) }}
       </span>
     {% endfor %}
+    {% if 'quarantined' in stats and stats['quarantined'] > 0 %}
+      <span class="badge bg-warning" data-diff="quarantined">
+        {{ stats['quarantined'] }}
+        {{ _('quarantined') }}
+      </span>
+    {% endif %}
   </p>
 {% endif %}
 

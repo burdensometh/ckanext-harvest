@@ -407,7 +407,12 @@ class HarvesterBase(SingletonPlugin):
                 .outerjoin(HarvestObject,
                            sa.and_(HarvestObject.harvest_job_id == HarvestJob.id,
                                    HarvestObject.current == False,  # noqa: E712
-                                   HarvestObject.report_status != 'not modified'))
+                                   HarvestObject.report_status != 'not modified',
+                                   # Quarantined records are handled (they are
+                                   # waiting for an administrator), not a job
+                                   # failure, so they do not force a full
+                                   # re-gather on the next run.
+                                   HarvestObject.report_status != 'quarantined'))
                 .options(contains_eager(HarvestJob.objects))
                 .order_by(HarvestJob.gather_started.desc()))
         # now check them until we find one with no fetch/import errors

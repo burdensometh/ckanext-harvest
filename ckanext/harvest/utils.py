@@ -448,6 +448,98 @@ def import_stage(
     print("{0} objects reimported".format(objs_count))
 
 
+def list_quarantine(source_id_or_name=None, status=None):
+    """List records quarantined by the harvest source field rules."""
+    context = {
+        "model": model,
+        "session": model.Session,
+        "user": _admin_user()["name"],
+        "ignore_auth": True,
+    }
+    data_dict = {}
+    if source_id_or_name:
+        data_dict["source_id"] = source_id_or_name
+    if status:
+        data_dict["status"] = status
+
+    entries = tk.get_action("harvest_quarantine_list")(context, data_dict)
+
+    output = StringIO()
+    if not entries:
+        print("No quarantined records", file=output)
+        return output.getvalue()
+
+    for entry in entries:
+        print("Quarantined record: {0}".format(entry["id"]), file=output)
+        print("\tguid: {0}".format(entry.get("guid")), file=output)
+        print("\tsource: {0}".format(entry.get("harvest_source_id")), file=output)
+        print("\tstatus: {0}".format(entry.get("status")), file=output)
+        for violation in entry.get("violations", []):
+            field = violation.get("field")
+            reason = violation.get("reason")
+            if reason == "not_allowed":
+                print(
+                    "\tfield {0}: value {1!r} not allowed (allowed: {2})".format(
+                        field,
+                        violation.get("value"),
+                        ", ".join(violation.get("allowed", [])),
+                    ),
+                    file=output,
+                )
+            else:
+                print(
+                    "\tfield {0}: missing or empty".format(field),
+                    file=output,
+                )
+        print("", file=output)
+
+    print(
+        "There {0} {1} quarantined record{2}".format(
+            "is" if len(entries) == 1 else "are",
+            len(entries),
+            "" if len(entries) == 1 else "s",
+        ),
+        file=output,
+    )
+    return output.getvalue()
+
+
+def replay_quarantine(entry_id=None, source_id_or_name=None):
+    """Replay quarantined records after the source field rules were fixed."""
+    context = {
+        "model": model,
+        "session": model.Session,
+        "user": _admin_user()["name"],
+        "ignore_auth": True,
+    }
+    data_dict = {}
+    if entry_id:
+        data_dict["id"] = entry_id
+    elif source_id_or_name:
+        data_dict["source_id"] = source_id_or_name
+
+    results = tk.get_action("harvest_quarantine_replay")(context, data_dict)
+
+    output = StringIO()
+    for result in results:
+        print(
+            "{0}: {1} ({2})".format(
+                result.get("id"),
+                result.get("status"),
+                result.get("message", ""),
+            ),
+            file=output,
+        )
+        for violation in result.get("violations", []):
+            print(
+                "\tfield {0}: {1}".format(
+                    violation.get("field"), violation.get("reason")),
+                file=output,
+            )
+    print("{0} record(s) processed".format(len(results)), file=output)
+    return output.getvalue()
+
+
 def job_all():
     context = {
         "model": model,

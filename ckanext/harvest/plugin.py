@@ -353,6 +353,9 @@ class Harvest(p.SingletonPlugin, DefaultDatasetForm, DefaultTranslation):
                 'harvest_frequencies': harvest_helpers.harvest_frequencies,
                 'link_for_harvest_object': harvest_helpers.link_for_harvest_object,
                 'harvest_source_extra_fields': harvest_helpers.harvest_source_extra_fields,
+                'harvest_source_quarantine': harvest_helpers.harvest_source_quarantine,
+                'harvest_source_quarantine_pending_count': (
+                    harvest_helpers.harvest_source_quarantine_pending_count),
                 'get_harvest_source': harvest_helpers.get_harvest_source,
                 }
 

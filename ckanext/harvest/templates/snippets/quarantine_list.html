@@ -1,0 +1,71 @@
+{#
+Displays the records quarantined by the harvest source field rules.
+
+Each entry keeps the original record identifier and shows every offending
+field together with the reason it was rejected, so a catalogue administrator
+can correct the source configuration and replay the record.
+
+entries        - list of quarantine entry dicts
+harvest_source - dict of the harvest source these entries belong to
+
+Example:
+
+  {% snippet 'snippets/quarantine_list.html', entries=entries, harvest_source=harvest_source %}
+
+#}
+<section class="module-content">
+  <h2>
+    {{ _('Quarantined records') }}
+    <small>{{ _('Records that did not comply with the field rules configured for this source') }}</small>
+  </h2>
+  <p class="help-block">
+    {{ _('These records were kept aside instead of overwriting good local datasets. After correcting the source field rules, replay them so they can be imported.') }}
+  </p>
+  <table class="table table-bordered table-hover harvest-quarantine-list">
+    <thead>
+      <tr>
+        <th>{{ _('Record') }}</th>
+        <th>{{ _('Status') }}</th>
+        <th>{{ _('Fields and reasons') }}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for entry in entries %}
+        <tr>
+          <td>
+            <h5>{{ entry.guid }}</h5>
+            {% if entry.harvest_object_id %}
+              <a href="{{ h.url_for('harvester.object_show', id=entry.harvest_object_id) }}" class="btn btn-small">
+                {{ _('Local content') }}
+              </a>
+            {% endif %}
+          </td>
+          <td>
+            {% if entry.status == 'pending' %}
+              <span class="badge bg-warning">{{ _('Pending') }}</span>
+            {% else %}
+              <span class="badge bg-success">{{ _('Replayed') }}</span>
+            {% endif %}
+          </td>
+          <td>
+            {% for violation in entry.violations %}
+              <div class="error">
+                {% if violation.reason == 'not_allowed' %}
+                  {{ _('Field') }} <strong>{{ violation.field }}</strong>:
+                  {{ _('value') }} <code>{{ violation.value }}</code>
+                  {{ _('is not allowed') }}
+                  {% if violation.allowed %}
+                    ({{ _('allowed values') }}: {{ violation.allowed|join(', ') }})
+                  {% endif %}
+                {% else %}
+                  {{ _('Field') }} <strong>{{ violation.field }}</strong>:
+                  {{ _('missing or empty but required') }}
+                {% endif %}
+              </div>
+            {% endfor %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>

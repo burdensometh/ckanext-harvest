@@ -344,6 +344,47 @@ def import_stage(
             tk.error_shout(u"Source <{}> not found.".format(id))
 
 
+@harvester.command("quarantine-list")
+@click.option("-s", "--source", metavar="SOURCE_ID_OR_NAME", default=None,
+              help="Only list records quarantined for this harvest source")
+@click.option("-t", "--status", type=click.Choice(["pending", "replayed"]),
+              default=None, help="Only list entries with this status")
+@click.pass_context
+def quarantine_list(ctx, source, status):
+    """List records quarantined because they did not comply with the harvest
+    source field rules.
+
+    Each entry shows the offending fields and the reason, together with the
+    source it belongs to.  Use ``quarantine-replay`` after correcting the
+    source configuration to import the records again.
+    """
+    flask_app = ctx.meta["flask_app"]
+    with flask_app.test_request_context():
+        result = utils.list_quarantine(source, status)
+    click.echo(result)
+
+
+@harvester.command("quarantine-replay")
+@click.option("-i", "--id", metavar="QUARANTINE_ID", default=None,
+              help="Replay a single quarantine entry")
+@click.option("-s", "--source", metavar="SOURCE_ID_OR_NAME", default=None,
+              help="Replay every pending entry for this harvest source")
+@click.pass_context
+def quarantine_replay(ctx, id, source):
+    """Replay quarantined records after correcting the source field rules.
+
+    Only records present in the quarantine list are re-imported; datasets
+    that were already imported successfully are not touched.
+    """
+    if not id and not source:
+        raise click.UsageError(
+            "Please provide either --id or --source")
+    flask_app = ctx.meta["flask_app"]
+    with flask_app.test_request_context():
+        result = utils.replay_quarantine(id, source)
+    click.echo(result)
+
+
 @harvester.command()
 @click.pass_context
 def clean_harvest_log(ctx):

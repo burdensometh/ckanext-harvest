@@ -11,6 +11,17 @@ from ckan.lib.helpers import json
 from ckan.plugins import toolkit
 
 from ckanext.harvest.model import HarvestObject
+from ckanext.harvest.logic.field_rules import (
+    parse_field_rules,
+    rules_configured,
+    validate_field_rules_config,
+    validate_package_dict,
+)
+from ckanext.harvest.logic.quarantine import (
+    mark_replayed,
+    quarantine_object,
+    source_id_for_object,
+)
 from .base import HarvesterBase
 
 import logging
@@ -169,6 +180,11 @@ class CKANHarvester(HarvesterBase):
                     if not isinstance(config_obj[key], bool):
                         raise ValueError('%s must be boolean' % key)
 
+            # Validate the field rules used to quarantine non-compliant
+            # records so a malformed rule set is rejected in the form rather
+            # than silently disabling validation.
+            validate_field_rules_config(config_obj)
+
         except ValueError as e:
             raise e
 
@@ -180,6 +196,41 @@ class CKANHarvester(HarvesterBase):
             creating or updating the actual package.
         '''
         return package_dict
+
+    def import_package_dict(self, package_dict, harvest_object):
+        '''
+            Validates ``package_dict`` against the field rules configured on
+            the harvest source and imports it if it complies.
+
+            Records that do not comply are quarantined (the original payload
+            is kept together with the offending fields and reasons) and the
+            import stage returns ``'quarantined'``.  Compliant records are
+            imported as usual, so healthy local datasets are never blocked by
+            a few non-compliant ones.
+
+            Subclasses that override ``import_stage`` wholesale can call this
+            method to get the same behaviour.
+        '''
+        rules = parse_field_rules(self.config or {})
+        if rules_configured(rules):
+            violations = validate_package_dict(package_dict, rules)
+            if violations:
+                quarantine_object(harvest_object, violations)
+                return 'quarantined'
+
+        result = self._create_or_update_package(
+            package_dict, harvest_object, package_dict_form='package_show')
+
+        if result is True and rules_configured(rules):
+            # A record that was quarantined before (e.g. before the rules
+            # were corrected) is now imported, so close the loop.
+            mark_replayed(
+                source_id_for_object(harvest_object),
+                harvest_object.guid,
+                getattr(harvest_object, 'package_id', None),
+            )
+
+        return result
 
     def gather_stage(self, harvest_job):
         log.debug('In CKANHarvester gather_stage (%s)',
@@ -547,8 +598,7 @@ class CKANHarvester(HarvesterBase):
 
             package_dict = self.modify_package_dict(package_dict, harvest_object)
 
-            result = self._create_or_update_package(
-                package_dict, harvest_object, package_dict_form='package_show')
+            result = self.import_package_dict(package_dict, harvest_object)
 
             return result
         except ValidationError as e:

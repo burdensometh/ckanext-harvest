@@ -68,7 +68,46 @@ class TestBlueprint:
 
         assert job["id"] in response.body
 
-    def test_about_page_rendered(self, app):
+    def test_admin_page_shows_quarantine_entries(self, app):
+        import json
+
+        source_obj = harvest_factories.HarvestSourceObj()
+        job = harvest_factories.HarvestJobObj(source=source_obj)
+
+        from ckanext.harvest.logic.quarantine import quarantine_object
+        from ckanext.harvest.model import HarvestObject
+        harvest_object = HarvestObject(
+            guid='quarantined-guid',
+            job=job,
+            content=json.dumps({'title': 'x'}),
+        )
+        harvest_object.save()
+        quarantine_object(harvest_object, [
+            {'field': 'license_id', 'reason': 'missing',
+             'allowed': ['cc-by']},
+        ])
+
+        sysadmin = factories.SysadminWithToken()
+        headers = {"Authorization": sysadmin["token"]}
+
+        url = url_for("harvester.admin", id=source_obj.id)
+        response = app.get(url, headers=headers)
+
+        assert 'quarantined-guid' in response.body
+        assert 'license_id' in response.body
+        assert 'Quarantined records' in response.body
+
+    def test_admin_page_without_quarantine_entries(self, app):
+        source_obj = harvest_factories.HarvestSourceObj()
+        harvest_factories.HarvestJob(source=source_obj)
+
+        sysadmin = factories.SysadminWithToken()
+        headers = {"Authorization": sysadmin["token"]}
+
+        response = app.get(
+            url_for("harvester.admin", id=source_obj.id), headers=headers)
+
+        assert 'Quarantined records' not in response.body
 
         source = harvest_factories.HarvestSource()
 

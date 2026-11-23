@@ -1,6 +1,7 @@
 from ckan.plugins import toolkit as pt
 
-from ckanext.harvest.logic.auth import get_job_object
+from ckanext.harvest.logic.auth import get_job_object, user_is_sysadmin
+from ckanext.harvest.logic.auth.update import harvest_source_update
 
 
 def auth_allow_anonymous_access(auth_function):
@@ -121,6 +122,22 @@ def harvest_object_list(context, data_dict):
     TODO: remove
     '''
     return {'success': True}
+
+
+def harvest_quarantine_list(context, data_dict):
+    '''
+        Authorization check for listing quarantined records
+
+        Only users who could manage the harvest source (i.e. the catalogue
+        administrators) can inspect the original records.
+    '''
+    source_id = data_dict.get('source_id')
+    if not source_id:
+        if not user_is_sysadmin(context):
+            return {'success': False,
+                    'msg': pt._('Only sysadmins can list all quarantined records')}
+        return {'success': True}
+    return harvest_source_update(context, {'id': source_id})
 
 
 @auth_allow_anonymous_access

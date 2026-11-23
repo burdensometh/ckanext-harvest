@@ -138,3 +138,21 @@ def harvest_source_extra_fields():
             continue
         fields[harvester.info()['name']] = list(harvester.extra_schema().keys())
     return fields
+
+
+def harvest_source_quarantine(source_id):
+    '''Return the records quarantined for ``source_id``, newest first.'''
+    context = {'model': model, 'session': model.Session,
+               'user': p.toolkit.c.user or p.toolkit.c.author}
+    try:
+        return logic.get_action('harvest_quarantine_list')(
+            context, {'source_id': source_id})
+    except (logic.NotAuthorized, logic.ObjectNotFound):
+        return []
+
+
+def harvest_source_quarantine_pending_count(source_id):
+    return len([
+        entry for entry in harvest_source_quarantine(source_id)
+        if entry.get('status') == 'pending'
+    ])

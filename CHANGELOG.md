@@ -2,6 +2,13 @@
 
 ## [Unreleased](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...HEAD)
 
+* Add harvest source field rules. Records that no longer provide a required
+  field (e.g. a title) or one of the agreed licences are quarantined instead of
+  overwriting good local datasets. The original payload and the offending
+  fields/reasons are kept, and administrators can replay them after correcting
+  the rules (`harvest_quarantine_list` / `harvest_quarantine_replay` actions
+  and `harvester quarantine-list` / `harvester quarantine-replay` commands).
+
 ## [v1.6.3](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...v1.6.3) - 2026-08-12
 
 * The extension can now be installed via `pip install ckanext-harvest`: included requirements in pyproject.toml. To use the RabbitMQ backend, use `pip install ckanext-harvest[amqp]`.

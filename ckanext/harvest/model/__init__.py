@@ -26,6 +26,10 @@ except ImportError:
 
 UPDATE_FREQUENCIES = ["MANUAL", "MONTHLY", "WEEKLY", "BIWEEKLY", "DAILY", "ALWAYS"]
 
+# Status values for HarvestQuarantine entries.
+QUARANTINE_STATUS_PENDING = "pending"
+QUARANTINE_STATUS_REPLAYED = "replayed"
+
 log = logging.getLogger(__name__)
 
 
@@ -226,7 +230,8 @@ class HarvestObject(BaseModel, HarvestDomainObject):
         ForeignKey("package.id", deferrable=True),
         nullable=True,
     )
-    # report_status: 'added', 'updated', 'not modified', 'deleted', 'errored'
+    # report_status: 'added', 'updated', 'not modified', 'deleted', 'errored',
+    #                'quarantined'
     report_status = Column(types.UnicodeText, nullable=True)
     harvest_job_id_idx = Index("harvest_job_id")
     harvest_source_id_idx = Index("harvest_source_id")
@@ -335,6 +340,59 @@ class HarvestObjectError(BaseModel, HarvestDomainObject):
         finally:
             log_message = "{0}, line {1}".format(message, line) if line else message
             log.debug(log_message)
+
+
+class HarvestQuarantine(BaseModel, HarvestDomainObject):
+    """A quarantined record that could not be imported because it did not
+    comply with the harvest source field rules.
+
+    The original payload is retained (``content``) together with the specific
+    fields that failed and the reason for each failure (``violations``, stored
+    as JSON).  This lets a catalogue administrator fix the rules and replay
+    the record without a new harvest, while good local datasets keep their
+    existing values untouched.
+
+    A record is unique per harvest source and remote ``guid``; when the same
+    non-compliant record is harvested again, the existing entry is updated
+    instead of creating a duplicate.
+    """
+
+    __tablename__ = "harvest_quarantine"
+
+    id = Column(types.UnicodeText, primary_key=True, default=make_uuid)
+    guid = Column(types.UnicodeText, default="")
+    # The remote record as it was fetched.
+    content = Column(types.UnicodeText, nullable=True)
+    # JSON encoded list of {field, reason, value?, allowed?} dicts.
+    violations = Column(types.UnicodeText, nullable=True)
+    # pending (waiting for a replay) | replayed (imported successfully)
+    status = Column(types.UnicodeText, default=QUARANTINE_STATUS_PENDING)
+    package_id = Column(types.UnicodeText, nullable=True)
+    created = Column(types.DateTime, default=datetime.datetime.utcnow)
+    updated = Column(types.DateTime, default=datetime.datetime.utcnow)
+    harvest_object_id = Column(
+        types.UnicodeText, ForeignKey("harvest_object.id"), nullable=True
+    )
+    harvest_source_id = Column(
+        types.UnicodeText, ForeignKey("harvest_source.id"), nullable=True
+    )
+    harvest_job_id = Column(
+        types.UnicodeText, ForeignKey("harvest_job.id"), nullable=True
+    )
+
+    harvest_source_id_idx = Index("harvest_quarantine_source_id_idx")
+    guid_idx = Index("harvest_quarantine_guid_idx")
+
+    source = relationship(HarvestSource, lazy="select", backref="quarantine_entries")
+
+    @classmethod
+    def get_by_source_and_guid(cls, source_id, guid):
+        return (
+            Session.query(cls)
+            .filter(cls.harvest_source_id == source_id)
+            .filter(cls.guid == guid)
+            .first()
+        )
 
 
 class HarvestLog(BaseModel, HarvestDomainObject):

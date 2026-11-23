@@ -91,6 +91,196 @@ def harvest_source_update(context, data_dict):
     return source
 
 
+def harvest_quarantine_replay(context, data_dict):
+    '''Re-imports records that were quarantined by the harvest source field
+    rules after an administrator has corrected those rules.
+
+    Replay is driven by the quarantine list: only the records in it are
+    considered, so datasets that were imported successfully by earlier
+    harvests are left untouched.
+
+    :param id: replay a single quarantine entry (optional)
+    :type id: string
+    :param source_id: replay every pending entry for this harvest source
+        (optional, alternative to ``id``)
+    :type source_id: string
+
+    :returns: a list with one result per entry, including its new status
+        (``replayed``, ``pending`` or ``error``) and, when it is still
+        non-compliant, the remaining violations
+    :rtype: list of dictionaries
+    '''
+    from ckanext.harvest.logic.quarantine import (
+        quarantined_entry_or_raise, list_entries)
+    from ckanext.harvest.model import QUARANTINE_STATUS_PENDING
+
+    check_access('harvest_quarantine_replay', context, data_dict)
+
+    entry_id = data_dict.get('id')
+    source_id = data_dict.get('source_id')
+
+    if entry_id:
+        entries = [quarantined_entry_or_raise(entry_id)]
+    elif source_id:
+        # Accept the source id or name, as the rest of the harvest actions do.
+        source = harvest_source_show(context, {'id': source_id})
+        entries = list_entries(
+            source_id=source['id'], status=QUARANTINE_STATUS_PENDING)
+    else:
+        raise toolkit.ValidationError(
+            'Please provide either an "id" or a "source_id" parameter')
+
+    results = []
+    for entry in entries:
+        results.append(_replay_quarantine_entry(context, entry))
+    return results
+
+
+def _replay_quarantine_entry(context, entry):
+    from ckanext.harvest.logic.field_rules import (
+        parse_field_rules, rules_configured, validate_package_dict)
+    from ckanext.harvest.logic.quarantine import (
+        violations_as_json, violations_from_json)
+    from ckanext.harvest.queue import get_harvester
+    from ckanext.harvest.model import (
+        HarvestSource,
+        QUARANTINE_STATUS_PENDING, QUARANTINE_STATUS_REPLAYED)
+
+    result = {
+        'id': entry.id,
+        'guid': entry.guid,
+        'status': entry.status,
+        'violations': violations_from_json(entry.violations),
+        'package_id': entry.package_id,
+    }
+
+    source = HarvestSource.get(entry.harvest_source_id) if entry.harvest_source_id else None
+    if not source:
+        result['status'] = 'error'
+        result['message'] = 'The harvest source for this entry no longer exists'
+        return result
+
+    try:
+        source_config = json.loads(source.config) if source.config else {}
+    except ValueError:
+        source_config = {}
+
+    rules = parse_field_rules(source_config)
+
+    try:
+        package_dict = json.loads(entry.content) if entry.content else {}
+    except ValueError:
+        result['status'] = 'error'
+        result['message'] = 'The stored record is not valid JSON'
+        return result
+
+    if rules_configured(rules):
+        violations = validate_package_dict(package_dict, rules)
+        if violations:
+            # Rules still reject the record: keep it in the list, but show
+            # the administrator the current reasons.
+            entry.violations = violations_as_json(violations)
+            entry.status = QUARANTINE_STATUS_PENDING
+            entry.save()
+            result['status'] = QUARANTINE_STATUS_PENDING
+            result['violations'] = violations
+            result['message'] = 'Record still does not comply with the field rules'
+            return result
+
+    harvester = get_harvester(source.type)
+    if not harvester:
+        result['status'] = 'error'
+        result['message'] = 'No harvester found for source type %s' % source.type
+        return result
+
+    obj = _harvest_object_for_entry(entry, source)
+    if obj is None:
+        result['status'] = 'error'
+        result['message'] = 'Could not build a harvest object to replay'
+        return result
+
+    obj.content = entry.content
+    # Replay runs only the import stage, but harvesters expect the object to
+    # have gone through fetch (and to be in the IMPORT state) as it had when
+    # the record was originally quarantined.
+    now = datetime.datetime.utcnow()
+    obj.fetch_started = obj.fetch_started or now
+    obj.fetch_finished = obj.fetch_finished or now
+    obj.state = 'IMPORT'
+    obj.import_started = now
+    obj.save()
+
+    try:
+        import_result = harvester.import_stage(obj)
+    except Exception as e:  # pragma: no cover - defensive
+        log.exception('Error replaying quarantine entry %s', entry.id)
+        result['status'] = 'error'
+        result['message'] = str(e)
+        return result
+    obj.import_finished = datetime.datetime.utcnow()
+    obj.state = 'COMPLETE'
+    if import_result not in (True, 'unchanged'):
+        obj.state = 'ERROR'
+    obj.save()
+
+    if import_result in (True, 'unchanged'):
+        entry.status = QUARANTINE_STATUS_REPLAYED
+        entry.violations = violations_as_json([])
+        entry.updated = datetime.datetime.utcnow()
+        if obj.package_id:
+            entry.package_id = obj.package_id
+        entry.save()
+        result['status'] = QUARANTINE_STATUS_REPLAYED
+        result['package_id'] = entry.package_id
+        result['message'] = 'Record imported successfully'
+    elif import_result == 'quarantined':
+        # The import stage itself found violations (e.g. a subclass added
+        # extra checks); keep it pending and surface the fresh reasons.
+        entry.status = QUARANTINE_STATUS_PENDING
+        entry.save()
+        result['status'] = QUARANTINE_STATUS_PENDING
+        result['violations'] = violations_from_json(entry.violations)
+        result['message'] = 'Record was quarantined again during replay'
+    else:
+        result['status'] = 'error'
+        result['message'] = 'The import stage did not import the record'
+        result['violations'] = violations_from_json(entry.violations)
+
+    return result
+
+
+def _harvest_object_for_entry(entry, source):
+    '''Return a HarvestObject that can be passed to ``import_stage``.
+
+    The original object is reused when it still exists.  Otherwise a fresh
+    object is attached to the original job, or to a new finished job so that
+    the harvester has access to the source configuration.
+    '''
+    from ckanext.harvest.model import HarvestObject, HarvestJob
+
+    if entry.harvest_object_id:
+        obj = HarvestObject.get(entry.harvest_object_id)
+        if obj is not None:
+            return obj
+
+    job = None
+    if entry.harvest_job_id:
+        job = HarvestJob.get(entry.harvest_job_id)
+
+    if job is None:
+        job = HarvestJob(source=source, status='Finished')
+        job.save()
+
+    obj = HarvestObject(
+        guid=entry.guid,
+        job=job,
+        harvest_source_id=source.id,
+    )
+    obj.content = entry.content
+    obj.save()
+    return obj
+
+
 def harvest_source_clear(context, data_dict):
     """
     Clears all datasets, jobs and objects related to a harvest source, but
@@ -137,6 +327,7 @@ def harvest_source_clear(context, data_dict):
     DELETE FROM harvest_object_extra WHERE harvest_object_id IN (
         SELECT id FROM harvest_object
         WHERE harvest_source_id = '{harvest_source_id}');
+    DELETE FROM harvest_quarantine WHERE harvest_source_id = '{harvest_source_id}';
     DELETE FROM harvest_object WHERE harvest_source_id = '{harvest_source_id}';
     DELETE FROM harvest_gather_error WHERE harvest_job_id IN (
         SELECT id FROM harvest_job WHERE source_id = '{harvest_source_id}');
@@ -350,6 +541,15 @@ def harvest_source_job_history_clear(context, data_dict):
              AND (NOT EXISTS (SELECT id FROM harvest_object WHERE harvest_job_id = obj.harvest_job_id
                               AND current = true))
             );
+        DELETE FROM harvest_quarantine AS q WHERE harvest_source_id = '{harvest_source_id}'
+         AND (q.harvest_object_id IS NULL
+              OR q.harvest_object_id IN (SELECT id FROM harvest_object AS obj
+                 WHERE harvest_source_id = '{harvest_source_id}'
+                 AND current != true
+                 AND (NOT EXISTS (SELECT id FROM harvest_job WHERE id = obj.harvest_job_id
+                                  AND status = 'Running'))
+                 AND (NOT EXISTS (SELECT id FROM harvest_object WHERE harvest_job_id = obj.harvest_job_id
+                                  AND current = true))));
         DELETE FROM harvest_object AS obj WHERE harvest_source_id = '{harvest_source_id}'
          AND current != true
          AND (NOT EXISTS (SELECT id FROM harvest_job WHERE id = obj.harvest_job_id
@@ -371,6 +571,7 @@ def harvest_source_job_history_clear(context, data_dict):
          IN (SELECT id FROM harvest_object WHERE harvest_source_id = '{harvest_source_id}');
         DELETE FROM harvest_object_extra WHERE harvest_object_id
          IN (SELECT id FROM harvest_object WHERE harvest_source_id = '{harvest_source_id}');
+        DELETE FROM harvest_quarantine WHERE harvest_source_id = '{harvest_source_id}';
         DELETE FROM harvest_object WHERE harvest_source_id = '{harvest_source_id}';
         DELETE FROM harvest_gather_error WHERE harvest_job_id
          IN (SELECT id FROM harvest_job WHERE source_id = '{harvest_source_id}');

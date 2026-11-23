@@ -306,6 +306,36 @@ def harvest_object_list(context, data_dict):
 
 
 @side_effect_free
+def harvest_quarantine_list(context, data_dict):
+    '''Returns the records quarantined because they did not comply with the
+    harvest source field rules.
+
+    :param source_id: only return entries for this harvest source (optional)
+    :type source_id: string
+    :param status: filter by ``pending`` or ``replayed`` (optional)
+    :type status: string
+
+    :returns: a list of quarantine entries, each with the original payload,
+              the offending ``violations`` (field and reason) and its status
+    :rtype: list of dictionaries
+    '''
+    from ckanext.harvest.logic.quarantine import list_entries, quarantine_dictize
+
+    p.toolkit.check_access('harvest_quarantine_list', context, data_dict)
+
+    source_id = data_dict.get('source_id')
+    status = data_dict.get('status')
+
+    if source_id:
+        # Accept the source id or name, as the rest of the harvest actions do.
+        source_id = harvest_source_show(
+            dict(context), {'id': source_id})['id']
+
+    entries = list_entries(source_id=source_id, status=status)
+    return [quarantine_dictize(entry) for entry in entries]
+
+
+@side_effect_free
 def harvesters_info_show(context, data_dict):
     '''Returns details of the installed harvesters.'''
 

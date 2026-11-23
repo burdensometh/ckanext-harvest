@@ -41,6 +41,11 @@ def harvest_job_dictize(job, context):
                         'errored': 0, 'deleted': 0}
         for status, count in stats:
             out['stats'][status] = count
+        # ``quarantined`` is only surfaced when it happened, so the shape of
+        # the stats dict is unchanged for harvests that do not use the field
+        # rule quarantine.
+        if not out['stats'].get('quarantined'):
+            out['stats'].pop('quarantined', None)
 
         # We actually want to check which objects had errors, because they
         # could have been added/updated anyway (eg bbox errors)
