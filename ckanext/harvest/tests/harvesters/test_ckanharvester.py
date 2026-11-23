@@ -231,6 +231,56 @@ class TestCkanHarvester(object):
 
         assert sorted(results_by_guid.keys()) == [mock_ckan.DATASETS[1]['id'], mock_ckan.DATASETS[0]['id']]
 
+    def test_gather_continues_when_page_is_all_duplicates(self):
+        # The remote catalogue changes whilst paging: the second page is made
+        # up entirely of datasets already seen, but the third page has new
+        # material. Paging must advance on the raw page, not the de-duplicated
+        # one, otherwise the new dataset is missed.
+        source = HarvestSourceObj(
+            url='http://localhost:%s/datasets_seen_page' % mock_ckan.PORT)
+        job = HarvestJobObj(source=source)
+
+        harvester = CKANHarvester()
+        obj_ids = harvester.gather_stage(job)
+
+        assert job.gather_errors == []
+        guids = sorted(
+            harvest_model.HarvestObject.get(obj_id).guid for obj_id in obj_ids)
+        assert guids == sorted([
+            mock_ckan.DATASETS[0]['id'],
+            mock_ckan.DATASETS[1]['id'],
+            mock_ckan.DATASETS_EXTRA[0]['id'],
+        ])
+
+    def test_gather_stuck_paging_is_a_gather_error(self):
+        # The remote keeps returning the same window of datasets whatever the
+        # offset, so paging can never finish. This must end as a diagnosable
+        # gather error and not an endless loop.
+        source = HarvestSourceObj(
+            url='http://localhost:%s/paging_stuck' % mock_ckan.PORT)
+        job = HarvestJobObj(source=source)
+
+        harvester = CKANHarvester()
+        obj_ids = harvester.gather_stage(job)
+
+        assert obj_ids is None
+        messages = [error.message for error in job.gather_errors]
+        assert len(messages) == 1
+        assert 'same page of datasets' in messages[0]
+
+    def test_gather_empty_catalogue_is_not_an_error(self):
+        # An empty remote catalogue is a legitimate result: no harvest objects
+        # and no gather error, so the job can finish cleanly.
+        source = HarvestSourceObj(
+            url='http://localhost:%s/empty_catalogue' % mock_ckan.PORT)
+        job = HarvestJobObj(source=source)
+
+        harvester = CKANHarvester()
+        obj_ids = harvester.gather_stage(job)
+
+        assert obj_ids == []
+        assert job.gather_errors == []
+
     def test_harvest_site_down(self):
         results_by_guid = run_harvest(
             url='http://localhost:%s/site_down' % mock_ckan.PORT,

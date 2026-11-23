@@ -2,6 +2,8 @@
 
 ## [Unreleased](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...HEAD)
 
+* CKAN harvester: page through remote datasets based on the raw search response, so a page made up only of already-seen datasets no longer stops the gather early, and duplicates are de-duplicated by dataset id before harvest objects are created. A remote that keeps returning the same window now ends with a diagnosable gather error, while an empty remote catalogue is treated as a valid result instead of a gather error.
+
 ## [v1.6.3](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...v1.6.3) - 2026-08-12
 
 * The extension can now be installed via `pip install ckanext-harvest`: included requirements in pyproject.toml. To use the RabbitMQ backend, use `pip install ckanext-harvest[amqp]`.

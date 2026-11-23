@@ -102,6 +102,26 @@ class MockCkanHandler(SimpleHTTPRequestHandler):
                                 DATASETS[1]['name']]
                 else:
                     datasets = []
+            elif self.test_name == 'datasets_seen_page':
+                # The remote catalogue changes while paging. One page is made
+                # up entirely of datasets already seen, but a later page still
+                # has new material, so paging must not stop on that page.
+                if params['start'] == '0':
+                    datasets = [DATASETS[0]['name'],
+                                DATASETS_EXTRA[0]['name']]
+                elif params['start'] == '100':
+                    datasets = [DATASETS[0]['name']]
+                elif params['start'] == '200':
+                    datasets = [DATASETS[1]['name']]
+                else:
+                    datasets = []
+            elif self.test_name == 'paging_stuck':
+                # The remote ignores the start offset and keeps returning the
+                # exact same window of datasets.
+                datasets = [DATASETS[0]['name']]
+            elif self.test_name == 'empty_catalogue':
+                # A valid, empty remote catalogue.
+                datasets = []
             else:
                 # ignore sort param for now
                 if 'sort' in params:
@@ -145,7 +165,7 @@ class MockCkanHandler(SimpleHTTPRequestHandler):
         self.respond('Mock CKAN doesnt recognize that call', status=400)
 
     def get_dataset(self, dataset_ref):
-        for dataset in DATASETS:
+        for dataset in DATASETS + DATASETS_EXTRA:
             if dataset['name'] == dataset_ref or \
                     dataset['id'] == dataset_ref:
                 if self.test_name == 'invalid_tag':
@@ -502,6 +522,17 @@ INVALID_TAGS = [
         "id": "84ce26de-6711-4e85-9609-f7d8a87b0fc8"
     },
     ]
+
+# A third dataset, only returned by some of the paging test scenarios.
+DATASETS_EXTRA = [
+    {'id': 'dataset3-id',
+     'name': 'dataset3',
+     'title': 'Test Dataset3',
+     'owner_org': '0f8380d6-241a-47de-aa52-8bd91c763d97',
+     'tags': [],
+     'groups': [],
+     'extras': []}
+]
 
 ORGS = [
     {'id': '0f8380d6-241a-47de-aa52-8bd91c763d97',

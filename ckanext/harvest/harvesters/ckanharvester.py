@@ -262,13 +262,17 @@ class CKANHarvester(HarvesterBase):
                     harvest_job)
                 return None
         if not pkg_dicts:
-            self._save_gather_error(
-                'No datasets found at CKAN: %s' % remote_ckan_base_url,
-                harvest_job)
+            # An empty catalogue is a valid result, not an error. Returning an
+            # empty list (rather than a gather error) lets the job finish
+            # successfully and be used as the baseline for the next run.
+            log.info('No datasets found at CKAN: %s', remote_ckan_base_url)
             return []
 
         # Create harvest objects for each dataset
         try:
+            # De-duplicate by dataset identity before creating any harvest
+            # objects. The remote catalogue may return the same dataset on
+            # several pages while it is being modified during the gather.
             package_ids = set()
             object_ids = []
             for pkg_dict in pkg_dicts:
@@ -315,14 +319,16 @@ class CKANHarvester(HarvesterBase):
         #   likely than any being added. If some are missed then it is assumed
         #   they will harvested the next time anyway. When datasets are added,
         #   we are at risk of seeing datasets twice in the paging, so we detect
-        #   and remove any duplicates.
+        #   and remove any duplicates. Because a whole page may consist of
+        #   datasets already seen, paging is advanced based on the raw page
+        #   returned by the remote CKAN, not on the de-duplicated one.
         params['sort'] = 'id asc'
         if fq_terms:
             params['fq'] = ' '.join(fq_terms)
 
         pkg_dicts = []
         pkg_ids = set()
-        previous_content = None
+        seen_windows = set()
         while True:
             url = base_search_url + '?' + urlencode(params)
             log.debug('Searching for CKAN datasets: %s', url)
@@ -334,35 +340,60 @@ class CKANHarvester(HarvesterBase):
                     'CKAN instance %s using URL %r. Error: %s' %
                     (remote_ckan_base_url, url, e))
 
-            if previous_content and content == previous_content:
-                raise SearchError('The paging doesn\'t seem to work. URL: %s' %
-                                  url)
             try:
                 response_dict = json.loads(content)
             except ValueError:
                 raise SearchError('Response from remote CKAN was not JSON: %r'
                                   % content)
-            try:
-                pkg_dicts_page = response_dict.get('result', {}).get('results',
-                                                                     [])
-            except ValueError:
+
+            result = (response_dict.get('result')
+                      if isinstance(response_dict, dict) else None)
+            if not isinstance(result, dict) or 'results' not in result:
                 raise SearchError('Response JSON did not contain '
                                   'result/results: %r' % response_dict)
+            pkg_dicts_page = result['results']
+            if not isinstance(pkg_dicts_page, list):
+                raise SearchError('Response JSON result/results was not a '
+                                  'list: %r' % response_dict)
+
+            # Termination is decided on the raw page returned by the remote
+            # CKAN. An empty page means we have been given every dataset. This
+            # has to be checked before de-duplication: a page made up entirely
+            # of datasets seen on earlier pages must not end the paging, as
+            # later pages can still contain new datasets.
+            if not pkg_dicts_page:
+                break
+
+            try:
+                window = frozenset(p['id'] for p in pkg_dicts_page)
+            except (KeyError, TypeError):
+                raise SearchError('Response JSON contained a dataset without '
+                                  'an id: %r' % response_dict)
+
+            # If the remote CKAN keeps returning the same window of datasets
+            # (for example it ignores the ``start`` parameter) the paging will
+            # never finish. Fail with a diagnostic gather error instead of
+            # looping forever.
+            if window in seen_windows:
+                raise SearchError(
+                    'The remote CKAN returned the same page of datasets for '
+                    'different paging offsets, so not all datasets could be '
+                    'gathered. URL: %s (offset: %s, datasets on page: %s)' %
+                    (url, params['start'], len(pkg_dicts_page)))
+            seen_windows.add(window)
 
             # Weed out any datasets found on previous pages (should datasets be
             # changing while we page)
-            ids_in_page = set(p['id'] for p in pkg_dicts_page)
-            duplicate_ids = ids_in_page & pkg_ids
+            duplicate_ids = window & pkg_ids
             if duplicate_ids:
                 pkg_dicts_page = [p for p in pkg_dicts_page
                                   if p['id'] not in duplicate_ids]
-            pkg_ids |= ids_in_page
+            pkg_ids |= window
 
             pkg_dicts.extend(pkg_dicts_page)
 
-            if len(pkg_dicts_page) == 0:
-                break
-
+            # Advance based on the raw page so that a page containing only
+            # already-seen datasets doesn't stop the paging.
             params['start'] = str(int(params['start']) + int(params['rows']))
 
         return pkg_dicts
