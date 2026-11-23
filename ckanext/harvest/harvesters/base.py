@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import datetime
 import logging
 import re
 import uuid
@@ -373,6 +374,104 @@ class HarvesterBase(SingletonPlugin):
                                 'ignore_auth': True}
         return p.toolkit.get_action('package_show')(
             package_show_context, data_dict)
+
+    def mark_datasets_for_deletion(self, harvest_job):
+        '''
+        Retracts datasets from this harvest source that the remote source no
+        longer lists, after a complete inventory (full refresh) job.
+
+        The gather stage of a full refresh job creates a HarvestObject for
+        every remote identity (GUID) currently available. Any locally held
+        dataset of this source whose current HarvestObject's GUID is not
+        among those seen in this job has therefore been withdrawn remotely
+        and is deleted locally. Only datasets belonging to the job's harvest
+        source are considered, so datasets harvested from other sources are
+        never touched.
+
+        A HarvestObject flagged as not current is created for each retracted
+        dataset, so the withdrawal is recorded as part of the job history and
+        shows up in the job statistics with report_status 'deleted'.
+
+        This must only be called once the job has completed successfully:
+        a failed or incomplete gather must not cause any deletion.
+
+        :param harvest_job: a successfully completed full refresh job
+        :returns: the list of package ids that were retracted
+        '''
+        source_id = harvest_job.source_id
+
+        # Identities seen remotely during this job's gather
+        seen_guids = set(guid for guid, in Session.query(HarvestObject.guid)
+                         .filter(HarvestObject.harvest_job_id == harvest_job.id)
+                         .all())
+
+        # The datasets currently provided by this source. Only 'current'
+        # objects point at datasets that are still actively harvested.
+        current_objects = Session.query(HarvestObject) \
+            .filter(HarvestObject.harvest_source_id == source_id) \
+            .filter(HarvestObject.current == True)  # noqa: E712
+
+        package_ids_to_delete = []
+        for current_object in current_objects:
+            if current_object.guid in seen_guids:
+                # Still present on the remote source
+                continue
+
+            package_id = current_object.package_id
+            if not package_id:
+                continue
+            package = Package.get(package_id)
+            if not package or package.state == 'deleted':
+                continue
+
+            package_ids_to_delete.append(package_id)
+
+            # Record the withdrawal on the job history. The object is not
+            # current, so fetch_and_import_stages would report it as
+            # 'deleted' if the object was processed normally.
+            HarvestObject(
+                guid=current_object.guid,
+                job=harvest_job,
+                package_id=package_id,
+                state='COMPLETE',
+                current=False,
+                report_status='deleted',
+                import_finished=datetime.datetime.utcnow(),
+            ).save()
+
+            # The previously current object is superseded by the deletion
+            # object above
+            current_object.current = False
+            current_object.save()
+
+        # Persist the withdrawal records before removing the packages, so the
+        # job history reflects them even if a package delete fails
+        if package_ids_to_delete:
+            Session.commit()
+
+        for package_id in package_ids_to_delete:
+            try:
+                context = {
+                    'model': model,
+                    'session': Session,
+                    'user': self._get_user_name(),
+                    'ignore_auth': True,
+                }
+                p.toolkit.get_action('package_delete')(
+                    context, {'id': package_id})
+            except Exception as e:
+                log.exception(
+                    'Could not delete package %s retracted by full refresh '
+                    'job %s: %r', package_id, harvest_job.id, e)
+                Session.rollback()
+
+        if package_ids_to_delete:
+            log.info(
+                'Full refresh job %s retracted %s dataset(s) no longer '
+                'present on harvest source %s',
+                harvest_job.id, len(package_ids_to_delete), source_id)
+
+        return package_ids_to_delete
 
     def _clean_tags(self, tags):
         try:

@@ -136,3 +136,30 @@ class IHarvester(Interface):
         :returns: True if the action was done, "unchanged" if the object didn't
                   need harvesting after all or False if there were errors.
         '''
+
+    def mark_datasets_for_deletion(self, harvest_job):
+        '''
+
+        [optional, provided by HarvesterBase]
+
+        Retracts datasets that have been withdrawn from the remote source
+        after a complete inventory (full refresh) job finished successfully.
+
+        A job is a full refresh when its gather stage lists every identity
+        currently available on the remote source, as opposed to an
+        incremental gather that only lists identities changed since the last
+        successful job. Harvesters signal this by setting
+        ``harvest_job.full_refresh = True``. The gathered identities must be
+        persisted as HarvestObjects (their ``guid`` is the remote identity).
+
+        Once a full refresh job completes without gather or object errors,
+        the framework calls this method with the finished job. It soft
+        deletes the datasets of the job's source whose current identity is
+        absent from the job's gathered identities. It must never touch
+        datasets harvested from other sources, and it must not be applied to
+        incremental or failed jobs, whose identity lists are incomplete or
+        untrustworthy.
+
+        :param harvest_job: a successfully completed full refresh job
+        :returns: the list of package ids that were retracted
+        '''

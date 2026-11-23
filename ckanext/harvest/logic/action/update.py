@@ -535,6 +535,77 @@ def harvest_objects_import(context, data_dict):
     return last_objects_count
 
 
+def _job_is_error_free(session, harvest_job):
+    '''
+    A job is considered successful (and its identity list trustworthy) only
+    when it has no gather errors and none of its objects failed fetching or
+    importing.
+    '''
+    has_gather_errors = session.query(HarvestGatherError.id) \
+        .filter(HarvestGatherError.harvest_job_id == harvest_job.id) \
+        .first()
+    if has_gather_errors:
+        return False
+
+    has_object_errors = session.query(HarvestObject.id) \
+        .filter(HarvestObject.harvest_job_id == harvest_job.id) \
+        .filter(sa.or_(HarvestObject.state == u'ERROR',
+                       HarvestObject.report_status == u'errored')) \
+        .first()
+    if has_object_errors:
+        return False
+
+    return True
+
+
+def _retract_withdrawn_datasets(context, harvest_job):
+    '''
+    After a successfully completed full refresh (complete inventory) job,
+    delete the datasets from this harvest source that were not seen on the
+    remote source during the gather.
+
+    Incremental jobs, failed jobs and datasets of other harvest sources are
+    left untouched.
+    '''
+    if not harvest_job.full_refresh:
+        return []
+
+    session = context['session']
+    if not _job_is_error_free(session, harvest_job):
+        log.info(
+            'Full refresh job %s finished with errors, skipping the '
+            'cleanup of datasets withdrawn from source %s',
+            harvest_job.id, harvest_job.source_id)
+        return []
+
+    # The gathered identity list is only a complete inventory when the
+    # gather actually produced objects. An empty gather is treated as a
+    # gather error elsewhere, but guard against it here as well.
+    gathered_anything = session.query(HarvestObject.id) \
+        .filter(HarvestObject.harvest_job_id == harvest_job.id) \
+        .first()
+    if not gathered_anything:
+        log.info(
+            'Full refresh job %s gathered no identities, skipping the '
+            'cleanup of source %s',
+            harvest_job.id, harvest_job.source_id)
+        return []
+
+    for harvester in PluginImplementations(IHarvester):
+        if harvester.info()['name'] == harvest_job.source.type:
+            if not hasattr(harvester, 'mark_datasets_for_deletion'):
+                log.warning(
+                    'Harvester for source type %s does not support full '
+                    'refresh cleanup, withdrawn datasets of source %s are kept',
+                    harvest_job.source.type, harvest_job.source_id)
+                return []
+            return harvester.mark_datasets_for_deletion(harvest_job)
+
+    log.warning('No harvester found for source type %s, cannot run full '
+                'refresh cleanup', harvest_job.source.type)
+    return []
+
+
 def _calculate_next_run(frequency):
 
     now = datetime.datetime.utcnow()
@@ -664,6 +735,8 @@ def harvest_jobs_run(context, data_dict):
                     else:
                         job_obj.finished = job['gather_finished']
                     job_obj.save()
+
+                    _retract_withdrawn_datasets(context, job_obj)
 
                     # Reindex the harvest source dataset so it has the latest
                     # status

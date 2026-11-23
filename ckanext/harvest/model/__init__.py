@@ -128,6 +128,13 @@ class HarvestJob(BaseModel, HarvestDomainObject):
     source_id = Column(types.UnicodeText, ForeignKey("harvest_source.id"))
     # status: New, Running, Finished
     status = Column(types.UnicodeText, default="New", nullable=False)
+    # A full refresh (complete inventory) job gathers the full list of
+    # identities currently available on the remote source. When such a job
+    # finishes successfully, datasets from this source whose identity was
+    # not seen during the gather are considered to have been withdrawn from
+    # the remote source and are deleted locally. Incremental jobs (only
+    # datasets changed since the last successful run) leave this as False.
+    full_refresh = Column(types.Boolean, default=False, nullable=False)
     source = relationship(
         "HarvestSource",
         lazy="select",

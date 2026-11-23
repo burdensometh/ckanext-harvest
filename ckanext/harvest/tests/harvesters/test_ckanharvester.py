@@ -17,7 +17,7 @@ from ckan.plugins import toolkit
 from ckanext.harvest.harvesters.ckanharvester import ContentFetchError
 from ckanext.harvest.tests.factories import (HarvestSourceObj, HarvestJobObj,
                                              HarvestObjectObj)
-from ckanext.harvest.tests.lib import run_harvest
+from ckanext.harvest.tests.lib import run_harvest, run_harvest_job
 import ckanext.harvest.model as harvest_model
 from ckanext.harvest.harvesters.base import HarvesterBase
 from ckanext.harvest.harvesters.ckanharvester import CKANHarvester
@@ -237,6 +237,97 @@ class TestCkanHarvester(object):
             harvester=CKANHarvester())
         assert not results_by_guid
         assert not was_last_job_considered_error_free()
+
+    def test_gather_marks_first_job_as_full_refresh(self):
+        source = HarvestSourceObj(url='http://localhost:%s/' % mock_ckan.PORT)
+        job = HarvestJobObj(source=source)
+
+        CKANHarvester().gather_stage(job)
+
+        # With no previous error-free job the complete remote inventory is
+        # gathered, so the job must be recorded as a full refresh
+        assert job.full_refresh is True
+
+    def test_gather_marks_incremental_job(self):
+        # An initial, error-free full refresh
+        source = HarvestSourceObj(url='http://localhost:%s/' % mock_ckan.PORT)
+        first_job = HarvestJobObj(source=source, run=False)
+        run_harvest_job(first_job, CKANHarvester())
+
+        # The next gather only asks for datasets modified since then
+        second_job = HarvestJobObj(source=source, run=False)
+        obj_ids = CKANHarvester().gather_stage(second_job)
+        assert isinstance(obj_ids, list)
+        assert second_job.full_refresh is False
+
+    def test_force_all_marks_job_as_full_refresh(self):
+        # An initial, error-free full refresh
+        source = HarvestSourceObj(
+            url='http://localhost:%s/' % mock_ckan.PORT,
+            config=json.dumps({'force_all': True}))
+        first_job = HarvestJobObj(source=source, run=False)
+        run_harvest_job(first_job, CKANHarvester())
+
+        # Even with a previous error-free job, force_all asks for the
+        # complete inventory again
+        second_job = HarvestJobObj(source=source, run=False)
+        CKANHarvester().gather_stage(second_job)
+        assert second_job.full_refresh is True
+
+    def test_full_refresh_retracts_withdrawn_datasets(self):
+        # Initial complete harvest: both remote datasets are created locally
+        source = HarvestSourceObj(
+            url='http://localhost:%s/' % mock_ckan.PORT,
+            source_type='ckan',
+            config=json.dumps({'force_all': True}))
+        first_job = HarvestJobObj(source=source, run=False)
+        run_harvest_job(first_job, CKANHarvester())
+
+        withdrawn_id = mock_ckan.DATASETS[1]['id']
+        assert model.Package.get(withdrawn_id).state == 'active'
+
+        # The remote source has withdrawn the second dataset. Force a full
+        # refresh and simulate the remote search returning only the first one
+        second_job = HarvestJobObj(source=source, run=False)
+        harvester = CKANHarvester()
+        with patch.object(harvester, '_search_for_datasets',
+                          return_value=[mock_ckan.DATASETS[0]]):
+            run_harvest_job(second_job, harvester)
+
+        second_job = harvest_model.HarvestJob.get(second_job.id)
+        assert second_job.full_refresh is True
+        assert model.Package.get(withdrawn_id).state == 'deleted'
+        assert model.Package.get(mock_ckan.DATASETS[0]['id']).state == 'active'
+
+        # The withdrawal shows up in the job statistics and source status
+        job_dict = call_action('harvest_job_show', {}, id=second_job.id)
+        assert job_dict['stats']['deleted'] == 1
+        status = call_action('harvest_source_show_status', {}, id=source.id)
+        assert status['total_datasets'] == 1
+
+    def test_incremental_job_keeps_withdrawn_datasets(self):
+        source = HarvestSourceObj(
+            url='http://localhost:%s/' % mock_ckan.PORT,
+            source_type='ckan')
+        first_job = HarvestJobObj(source=source, run=False)
+        run_harvest_job(first_job, CKANHarvester())
+
+        withdrawn_id = mock_ckan.DATASETS[1]['id']
+
+        # An incremental job (no force_all): even though the mock search
+        # happens to return only one dataset, the incomplete identity list
+        # must not cause any deletion
+        second_job = HarvestJobObj(source=source, run=False)
+        harvester = CKANHarvester()
+        with patch.object(harvester, '_search_for_datasets',
+                          return_value=[mock_ckan.DATASETS[0]]):
+            run_harvest_job(second_job, harvester)
+
+        second_job = harvest_model.HarvestJob.get(second_job.id)
+        assert second_job.full_refresh is False
+        assert model.Package.get(withdrawn_id).state == 'active'
+        job_dict = call_action('harvest_job_show', {}, id=second_job.id)
+        assert job_dict['stats']['deleted'] == 0
 
     def test_default_tags(self):
         config = {'default_tags': [{'name': 'geo'}]}

@@ -220,6 +220,12 @@ class CKANHarvester(HarvesterBase):
                 not self.config.get('force_all', False)):
             get_all_packages = False
 
+            # An incremental gather only lists datasets changed since the
+            # last successful job, so its identity list cannot be used to
+            # decide that datasets have been withdrawn.
+            harvest_job.full_refresh = False
+            harvest_job.save()
+
             # Request only the datasets modified since
             last_time = last_error_free_job.gather_started
             # Note: SOLR works in UTC, and gather_started is also UTC, so
@@ -250,6 +256,14 @@ class CKANHarvester(HarvesterBase):
 
         # Fall-back option - request all the datasets from the remote CKAN
         if get_all_packages:
+            # A complete inventory of every identity available on the remote
+            # source is gathered. Persist that fact so the framework can
+            # retract locally held datasets that are no longer listed, once
+            # the job completes successfully. The gathered identities
+            # themselves are persisted as HarvestObject rows below.
+            harvest_job.full_refresh = True
+            harvest_job.save()
+
             # Request all remote packages
             try:
                 pkg_dicts = self._search_for_datasets(remote_ckan_base_url,

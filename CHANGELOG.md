@@ -2,6 +2,15 @@
 
 ## [Unreleased](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...HEAD)
 
+* Full refresh (complete inventory) harvests now retract datasets that have
+  been withdrawn from the remote source. Jobs are marked with a persistent
+  `full_refresh` flag when their gather lists every remote identity; when
+  such a job finishes without errors, locally held datasets of that source
+  whose identity was not seen are soft-deleted and recorded with
+  report_status `deleted`, so they disappear from the catalog and the source
+  status reflects the change. Incremental jobs, failed full refreshes and
+  datasets of other sources are left untouched.
+
 ## [v1.6.3](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...v1.6.3) - 2026-08-12
 
 * The extension can now be installed via `pip install ckanext-harvest`: included requirements in pyproject.toml. To use the RabbitMQ backend, use `pip install ckanext-harvest[amqp]`.
