@@ -87,6 +87,17 @@ groups:
           no timeout on harvest jobs.
         example: 1440
 
+      - key: ckan.harvest.max_retries
+        type: int
+        default: 5
+        description: |
+          Maximum number of processing attempts for a single harvest object.
+          Objects whose fetch or import stage fails with a retryable (temporary
+          upstream) error can be requeued, either automatically when the
+          consumer crashes or via `harvest requeue`. Once an object has used
+          this many attempts it is treated as a permanent failure and will not
+          be requeued again.
+
       - key: ckan.harvest.status_mail.all
         type: bool
         default: false

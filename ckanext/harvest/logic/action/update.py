@@ -26,9 +26,12 @@ from ckanext.harvest.utils import (
     DATASET_TYPE_NAME
 )
 from ckanext.harvest.queue import (
-    get_gather_publisher, resubmit_jobs, resubmit_objects)
+    get_gather_publisher, resubmit_jobs, resubmit_objects,
+    requeue_retryable_objects, job_has_retryable_gather_errors,
+    get_max_retries)
 
-from ckanext.harvest.model import HarvestSource, HarvestJob, HarvestObject, HarvestGatherError
+from ckanext.harvest.model import (HarvestSource, HarvestJob, HarvestObject,
+                                   HarvestGatherError)
 from ckanext.harvest.logic import HarvestJobExists
 from ckanext.harvest.logic.dictization import harvest_job_dictize
 
@@ -973,3 +976,78 @@ def harvest_source_reindex(context, data_dict):
     package_index.index_package(new_dict, defer_commit=defer_commit)
 
     return True
+
+
+def harvest_objects_requeue(context, data_dict):
+    '''
+    Requeue, within the scope of a single harvest job, the objects that
+    failed because of a temporary upstream condition and are still within
+    their retry budget.
+
+    This is the safe recovery path after a partial harvest:
+
+    * only objects of the given job are touched - successfully published
+      objects and objects of other jobs are never affected;
+    * only objects in the ERROR state whose most recent error is flagged
+      retryable are requeued; permanent failures stay in place;
+    * objects that have already used up ``ckan.harvest.max_retries``
+      attempts (default 5) are skipped;
+    * objects already present in the fetch queue are not enqueued twice;
+    * the full error history is preserved - no HarvestObjectError rows are
+      deleted, a new one is simply recorded on the next attempt.
+
+    :param id: the id of the harvest job to recover
+    :type id: string
+    :param include_gather: if True and the job has retryable gather errors,
+        put the whole job back on the gather queue (only allowed when the
+        job produced no harvest objects, to avoid duplicating objects)
+    :type include_gather: bool
+
+    :returns: a summary dict with the job id and requeue counts
+    :rtype: dict
+    '''
+    check_access('harvest_objects_requeue', context, data_dict)
+
+    job_id = logic.get_or_bust(data_dict, 'id')
+    include_gather = toolkit.asbool(data_dict.get('include_gather', False))
+
+    job = HarvestJob.get(job_id)
+    if not job:
+        raise NotFound('Harvest job %s does not exist' % job_id)
+
+    result = {
+        'job_id': job.id,
+        'max_retries': get_max_retries(),
+        'requeued': 0,
+        'max_retries_exceeded': 0,
+        'not_retryable': 0,
+        'already_queued': 0,
+        'gather_requeued': False,
+    }
+
+    # Requeue the failed-but-retryable fetch/import objects of this job.
+    object_result = requeue_retryable_objects(job)
+    result.update(object_result)
+
+    # Optionally recover a gather-stage failure. This is only safe when the
+    # job produced no objects of its own: otherwise re-running the gather
+    # would create duplicate HarvestObjects for the same remote identifiers.
+    if include_gather and job_has_retryable_gather_errors(job):
+        session = context['session']
+        object_count = session.query(HarvestObject.id) \
+            .filter(HarvestObject.harvest_job_id == job.id).count()
+        if object_count:
+            raise toolkit.ValidationError(
+                'Job %s already contains %s harvest object(s); re-running '
+                'its gather stage would create duplicates. Requeue the '
+                'failed objects instead.' % (job.id, object_count))
+        job.status = u'Running'
+        job.finished = None
+        job.save()
+        get_gather_publisher().send({'harvest_job_id': job.id})
+        result['gather_requeued'] = True
+        log.info('Re-sent job %s to the gather queue after a retryable '
+                 'gather error', job.id)
+
+    log.info('Requeue summary for job %s: %r', job.id, result)
+    return result

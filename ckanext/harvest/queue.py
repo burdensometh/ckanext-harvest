@@ -14,7 +14,9 @@ from ckan.lib.base import config
 from ckan.plugins import PluginImplementations
 from ckan import model
 
-from ckanext.harvest.model import HarvestJob, HarvestObject, HarvestGatherError
+from ckanext.harvest.model import (HarvestJob, HarvestObject,
+                                   HarvestGatherError, HarvestObjectError,
+                                   TransientHarvestError)
 from ckanext.harvest.interfaces import IHarvester
 
 log = logging.getLogger(__name__)
@@ -22,7 +24,7 @@ assert not log.disabled
 
 __all__ = ['get_gather_publisher', 'get_gather_consumer',
            'get_fetch_publisher', 'get_fetch_consumer',
-           'get_harvester']
+           'get_harvester', 'get_max_retries', 'requeue_retryable_objects']
 
 PORT = 5672
 USERID = 'guest'
@@ -32,6 +34,12 @@ VIRTUAL_HOST = '/'
 MQ_TYPE = 'redis'
 REDIS_PORT = 6379
 REDIS_DB = 0
+
+# Default number of attempts at processing a single harvest object before it
+# is given up on. The same budget covers automatic redelivery (consumer
+# crashes / resubmit_objects) and operator-driven requeues, so a single
+# object cannot occupy the fetch queue indefinitely.
+DEFAULT_MAX_RETRIES = 5
 
 # settings for AMQP
 EXCHANGE_TYPE = 'direct'
@@ -204,6 +212,126 @@ def resubmit_objects():
             publisher.send({'harvest_object_id': object_id})
 
     publisher.close()
+
+
+def get_max_retries():
+    '''
+    Maximum number of processing attempts allowed for a single harvest
+    object (configurable via ``ckan.harvest.max_retries``). Once an object
+    reaches this number it is treated as permanently failed and will not be
+    requeued again.
+    '''
+    try:
+        return int(config.get('ckan.harvest.max_retries',
+                              DEFAULT_MAX_RETRIES))
+    except ValueError:
+        log.warning('Invalid ckan.harvest.max_retries value, falling back '
+                    'to %s', DEFAULT_MAX_RETRIES)
+        return DEFAULT_MAX_RETRIES
+
+
+def _object_has_retryable_error(obj):
+    '''
+    An object is only recoverable if its most recent error was explicitly
+    flagged as retryable (a temporary upstream failure). Objects whose
+    errors are all permanent, or which have no error records, are excluded.
+    '''
+    latest_error = model.Session.query(HarvestObjectError) \
+        .filter_by(harvest_object_id=obj.id) \
+        .order_by(HarvestObjectError.created.desc()) \
+        .first()
+    return bool(latest_error and latest_error.retryable)
+
+
+def _queued_object_ids():
+    '''
+    Ids currently sitting in the fetch queue, so we never enqueue the same
+    object twice (which would multiply its retry consumption).
+    '''
+    backend = config.get('ckan.harvest.mq.type', MQ_TYPE)
+    if backend == 'redis':
+        connection = get_connection()
+        return [json.loads(body)['harvest_object_id']
+                for body in connection.lrange(get_fetch_routing_key(), 0, -1)]
+    # The AMQP backend does not let us inspect queued messages; rely on the
+    # object state (only ERROR objects are ever requeued) to avoid dupes.
+    return []
+
+
+def requeue_retryable_objects(job):
+    '''
+    Safely requeue, within the scope of a single harvest job, the objects
+    that failed because of a temporary upstream condition.
+
+    Safety properties:
+      * only ERROR objects belonging to *this* job are considered, so
+        successfully published objects and objects from other jobs are left
+        untouched;
+      * the object must carry a retryable error - permanent failures stay
+        where they are;
+      * objects that have exhausted their retry budget are skipped;
+      * objects already present in the fetch queue are not enqueued again;
+      * error history is never deleted, a new error is simply appended on
+        the next attempt.
+
+    Returns a dict with the counts of objects requeued, skipped because the
+    retry budget was exhausted, skipped because their failure was permanent
+    and skipped because they were already queued.
+    '''
+    max_retries = get_max_retries()
+    queued_ids = _queued_object_ids()
+
+    result = {'requeued': 0, 'max_retries_exceeded': 0,
+              'not_retryable': 0, 'already_queued': 0}
+
+    objects = model.Session.query(HarvestObject) \
+        .filter_by(harvest_job_id=job.id) \
+        .filter_by(state='ERROR') \
+        .all()
+
+    publisher = get_fetch_publisher()
+    try:
+        for obj in objects:
+            if obj.retry_times >= max_retries:
+                log.info('Not requeuing object %s: retry budget exhausted '
+                         '(%s/%s)', obj.id, obj.retry_times, max_retries)
+                result['max_retries_exceeded'] += 1
+                continue
+            if not _object_has_retryable_error(obj):
+                result['not_retryable'] += 1
+                continue
+            if obj.id in queued_ids:
+                log.debug('Object %s is already in the fetch queue, '
+                          'skipping', obj.id)
+                result['already_queued'] += 1
+                continue
+
+            # Reset the object to its pre-fetch state so the fetch consumer
+            # picks it up exactly like a freshly gathered object. The old
+            # HarvestObjectError rows are deliberately kept as history.
+            obj.state = 'WAITING'
+            obj.report_status = None
+            obj.save()
+            publisher.send({'harvest_object_id': obj.id})
+            queued_ids.append(obj.id)
+            result['requeued'] += 1
+            log.info('Requeued retryable object %s from job %s '
+                     '(attempt %s/%s)', obj.id, job.id,
+                     obj.retry_times + 1, max_retries)
+    finally:
+        publisher.close()
+
+    return result
+
+
+def job_has_retryable_gather_errors(job):
+    '''
+    True if the job recorded at least one gather error flagged as
+    retryable (eg the upstream source was temporarily unreachable).
+    '''
+    return model.Session.query(HarvestGatherError.id) \
+        .filter_by(harvest_job_id=job.id, retryable=True) \
+        .first() is not None
 
 
 class Publisher(object):
@@ -443,6 +571,17 @@ def gather_stage(harvester, job):
 
     try:
         harvest_object_ids = harvester.gather_stage(job)
+    except TransientHarvestError as e:
+        # A temporary upstream failure: record it as a retryable gather
+        # error but keep any objects already gathered during this round so
+        # they can still be fetched, and the job can be resumed later.
+        HarvestGatherError.create(
+            'Transient error during gather: %s' % e, job, retryable=True)
+        harvest_object_ids = [
+            obj_id for (obj_id,) in
+            model.Session.query(HarvestObject.id)
+            .filter_by(harvest_job_id=job.id).all()
+        ]
     except (Exception, KeyboardInterrupt):
         harvest_objects = model.Session.query(HarvestObject).filter_by(
             harvest_job_id=job.id
@@ -485,7 +624,7 @@ def fetch_callback(channel, method, header, body):
     obj.retry_times += 1
     obj.save()
 
-    if obj.retry_times >= 5:
+    if obj.retry_times >= get_max_retries():
         obj.state = "ERROR"
         obj.save()
         log.error('Too many consecutive retries for object {0}'.format(obj.id))
@@ -517,7 +656,18 @@ def fetch_and_import_stages(harvester, obj):
     obj.fetch_started = datetime.datetime.utcnow()
     obj.state = "FETCH"
     obj.save()
-    success_fetch = harvester.fetch_stage(obj)
+    try:
+        success_fetch = harvester.fetch_stage(obj)
+    except TransientHarvestError as e:
+        # Temporary upstream failure: keep the history but flag the error as
+        # retryable so the object can be requeued within its retry budget.
+        HarvestObjectError.create(
+            'Transient error during fetch: %s' % e, obj, 'Fetch',
+            retryable=True)
+        obj.state = "ERROR"
+        obj.report_status = "errored"
+        obj.save()
+        return
     obj.fetch_finished = datetime.datetime.utcnow()
     obj.save()
     if success_fetch is True:
@@ -525,7 +675,16 @@ def fetch_and_import_stages(harvester, obj):
         obj.import_started = datetime.datetime.utcnow()
         obj.state = "IMPORT"
         obj.save()
-        success_import = harvester.import_stage(obj)
+        try:
+            success_import = harvester.import_stage(obj)
+        except TransientHarvestError as e:
+            HarvestObjectError.create(
+                'Transient error during import: %s' % e, obj, 'Import',
+                retryable=True)
+            obj.state = "ERROR"
+            obj.report_status = "errored"
+            obj.save()
+            return
         obj.import_finished = datetime.datetime.utcnow()
         if success_import:
             obj.state = "COMPLETE"

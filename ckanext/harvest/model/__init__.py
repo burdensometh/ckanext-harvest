@@ -33,6 +33,18 @@ class HarvestError(Exception):
     pass
 
 
+class TransientHarvestError(HarvestError):
+    """A harvest failure caused by a temporary upstream condition.
+
+    Harvesters can raise this (or pass ``retryable=True`` when saving an
+    error) to signal that the failed job/object may succeed on a later
+    attempt and is therefore safe to requeue. Anything that is not marked
+    retryable is treated as a permanent failure and will not be requeued.
+    """
+
+    pass
+
+
 class HarvestDomainObject(DomainObject):
     """Convenience methods for searching objects"""
 
@@ -267,6 +279,11 @@ class HarvestObjectExtra(BaseModel, HarvestDomainObject):
 class HarvestGatherError(BaseModel, HarvestDomainObject):
     """Gather errors are raised during the **gather** stage of a harvesting
     job.
+
+    The ``retryable`` flag distinguishes failures caused by a temporary
+    upstream condition (eg a 503 response or a connection timeout), which
+    can safely be retried, from permanent failures. It defaults to False so
+    that existing behaviour is preserved.
     """
 
     __tablename__ = "harvest_gather_error"
@@ -275,15 +292,16 @@ class HarvestGatherError(BaseModel, HarvestDomainObject):
     harvest_job_id = Column(types.UnicodeText, ForeignKey("harvest_job.id"))
     message = Column(types.UnicodeText)
     created = Column(types.DateTime, default=datetime.datetime.utcnow)
+    retryable = Column(types.Boolean, default=False, nullable=False)
 
     job = relationship(HarvestJob, backref="gather_errors")
 
     @classmethod
-    def create(cls, message, job):
+    def create(cls, message, job, retryable=False):
         """
         Helper function to create an error object and save it.
         """
-        err = cls(message=message, job=job)
+        err = cls(message=message, job=job, retryable=retryable)
         try:
             err.save()
         except InvalidRequestError:
@@ -297,6 +315,11 @@ class HarvestGatherError(BaseModel, HarvestDomainObject):
 class HarvestObjectError(BaseModel, HarvestDomainObject):
     """Object errors are raised during the **fetch** or **import** stage of a
     harvesting job, and are referenced to a specific harvest object.
+
+    The ``retryable`` flag marks errors caused by a temporary upstream
+    condition (eg connection timeouts or 5xx responses). Only objects whose
+    latest errors are retryable are eligible to be requeued, and then only
+    while their ``retry_times`` budget has not been exhausted.
     """
 
     __tablename__ = "harvest_object_error"
@@ -307,6 +330,7 @@ class HarvestObjectError(BaseModel, HarvestDomainObject):
     stage = Column(types.UnicodeText)
     line = Column(types.Integer)
     created = Column(types.DateTime, default=datetime.datetime.utcnow)
+    retryable = Column(types.Boolean, default=False, nullable=False)
     harvest_error_harvest_object_id_idx = Index("harvest_object_id")
 
     object = relationship(
@@ -314,11 +338,12 @@ class HarvestObjectError(BaseModel, HarvestDomainObject):
     )
 
     @classmethod
-    def create(cls, message, object, stage="Fetch", line=None):
+    def create(cls, message, object, stage="Fetch", line=None, retryable=False):
         """
         Helper function to create an error object and save it.
         """
-        err = cls(message=message, object=object, stage=stage, line=line)
+        err = cls(message=message, object=object, stage=stage, line=line,
+                  retryable=retryable)
         try:
             err.save()
         except InvalidRequestError:

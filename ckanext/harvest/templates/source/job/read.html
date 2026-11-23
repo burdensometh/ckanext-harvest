@@ -45,6 +45,11 @@
               <td>
                   <div class="error">
                     {{ error.message }}
+                    {% if error.retryable %}
+                      <span class="badge text-bg-warning" title="{{ _('Temporary upstream failure - this job can be retried') }}">{{ _('Retryable') }}</span>
+                    {% else %}
+                      <span class="badge text-bg-secondary">{{ _('Permanent') }}</span>
+                    {% endif %}
                   </div>
               </td>
             </tr>
@@ -80,6 +85,9 @@
                     {{ error.message }}
                     {% if error.line %}
                       <span class="line">(line {{ error.line }})</span>
+                    {% endif %}
+                    {% if error.retryable %}
+                      <span class="badge text-bg-warning" title="{{ _('Temporary upstream failure - this object can be requeued') }}">{{ _('Retryable') }}</span>
                     {% endif %}
                   </div>
                 {% endfor %}

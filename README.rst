@@ -262,6 +262,7 @@ Please refer to the help message of each command for more details::
      jobs               Lists harvest jobs.
      purge-queues       Removes all jobs from fetch and gather queue.
      reindex            Reindexes the harvest source datasets.
+     requeue            Requeue the recoverable (temporarily failed)...
      run                Starts any harvest jobs that have been created by...
      run-test           Runs a harvest - for testing only.
      source             Manage harvest sources
@@ -687,6 +688,49 @@ nothing more to consume, and then run this abort command with the name or id of
 the harvest source:
 
       (pyenv) $ ckan --config=/etc/ckan/default/ckan.ini harvester job-abort {source-id/name}
+
+
+Recovering from temporary upstream failures
+===========================================
+
+When an upstream source suffers a temporary failure (connection timeout, reset,
+rate limiting or a 5xx response), the affected gather/object errors are stored
+with a ``retryable`` flag. Permanent failures (validation errors, 404s, ...) are
+left unflagged. The distinction is visible in the job's error report in the web
+UI and via the API.
+
+After the upstream has recovered, an operator can re-dispatch only the
+recoverable objects of a particular job, without touching the entries that were
+already published successfully and without losing the original error history::
+
+      (pyenv) $ ckan --config=/etc/ckan/default/ckan.ini harvester requeue {job-id}
+
+The command is deliberately scoped to a single job and only requeues objects
+that:
+
+* belong to that job and are in the ``ERROR`` state;
+* have a retryable error as their most recent error;
+* have not exhausted their retry budget;
+* are not already present in the fetch queue (no duplicate messages).
+
+If the gather stage itself failed temporarily and the job produced no objects,
+pass ``--include-gather`` to put the whole job back on the gather queue. This is
+refused for jobs that already contain harvest objects, because re-running their
+gather stage would create duplicates::
+
+      (pyenv) $ ckan --config=/etc/ckan/default/ckan.ini harvester requeue {job-id} --include-gather
+
+The same logic is available programmatically via the
+``harvest_objects_requeue`` action. Custom harvesters can mark their own
+temporary failures by raising ``ckanext.harvest.model.TransientHarvestError``
+from their gather/fetch/import stages, or by using the
+``_save_retryable_gather_error`` / ``_save_retryable_object_error`` helpers on
+``HarvesterBase``.
+
+The maximum number of processing attempts a single harvest object is allowed is
+configured with ``ckan.harvest.max_retries`` (default 5). The same budget covers
+automatic redelivery (consumer crashes, ``resubmit_objects``) and operator
+requeues, so a single object cannot occupy the fetch queue indefinitely.
 
 
 Setting up the harvesters on a production server

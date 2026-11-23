@@ -10,7 +10,7 @@ from ckan.logic import ValidationError, NotFound, get_action
 from ckan.lib.helpers import json
 from ckan.plugins import toolkit
 
-from ckanext.harvest.model import HarvestObject
+from ckanext.harvest.model import HarvestObject, TransientHarvestError
 from .base import HarvesterBase
 
 import logging
@@ -46,10 +46,23 @@ class CKANHarvester(HarvesterBase):
 
         try:
             http_request = requests.get(url, headers=headers)
+            # 429 (rate limited) and 5xx responses are temporary upstream
+            # conditions: raise a transient error so the failed object can be
+            # requeued instead of being recorded as a permanent failure.
+            if http_request.status_code == 429 or \
+                    500 <= http_request.status_code < 600:
+                raise TransientContentFetchError(
+                    'Temporary upstream error: HTTP %s %s' % (
+                        http_request.status_code, url))
+            http_request.raise_for_status()
         except HTTPError as e:
             raise ContentFetchError('HTTP error: %s %s' % (e.response.status_code, e.request.url))
         except RequestException as e:
-            raise ContentFetchError('Request error: %s' % e)
+            # Connection errors, timeouts and the like are temporary: let the
+            # caller decide whether to retry.
+            raise TransientContentFetchError('Request error: %s' % e)
+        except ContentFetchError:
+            raise
         except Exception as e:
             raise ContentFetchError('HTTP general exception: %s' % e)
         return http_request.text
@@ -256,7 +269,10 @@ class CKANHarvester(HarvesterBase):
                                                       fq_terms)
             except SearchError as e:
                 log.info('Searching for all datasets gave an error: %s', e)
-                self._save_gather_error(
+                # A failed search against the upstream CKAN is a temporary
+                # condition (timeout, 5xx, bad gateway...) so the job can be
+                # retried later rather than treated as a permanent failure.
+                self._save_retryable_gather_error(
                     'Unable to search remote CKAN for datasets:%s url:%s'
                     'terms:%s' % (e, remote_ckan_base_url, fq_terms),
                     harvest_job)
@@ -560,6 +576,13 @@ class CKANHarvester(HarvesterBase):
 
 
 class ContentFetchError(Exception):
+    pass
+
+
+class TransientContentFetchError(ContentFetchError, TransientHarvestError):
+    """A content fetch failure caused by a temporary upstream condition
+    (connection timeout, 429, 5xx...). Eligible for retry/requeue.
+    """
     pass
 
 

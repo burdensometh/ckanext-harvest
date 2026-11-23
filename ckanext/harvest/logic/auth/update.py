@@ -105,6 +105,19 @@ def harvest_sources_reindex(context, data_dict):
         return {'success': True}
 
 
+def harvest_objects_requeue(context, data_dict):
+    '''
+        Authorization check for requeuing failed harvest objects
+
+        Requeuing puts messages back on the harvest queues, so only
+        sysadmins can do it.
+    '''
+    if not user_is_sysadmin(context):
+        return {'success': False, 'msg': pt._('Only sysadmins can requeue failed harvest objects')}
+    else:
+        return {'success': True}
+
+
 def harvest_source_reindex(context, data_dict):
     '''
         Authorization check for reindexing a harvest source

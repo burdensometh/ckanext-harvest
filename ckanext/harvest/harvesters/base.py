@@ -148,6 +148,25 @@ class HarvesterBase(SingletonPlugin):
     _save_gather_error = HarvestGatherError.create
     _save_object_error = HarvestObjectError.create
 
+    def _save_retryable_gather_error(self, message, harvest_job):
+        '''
+        Records a gather error caused by a temporary upstream failure (eg a
+        connection timeout or a 5xx response). The error is flagged so that
+        the job can be safely retried later, whereas a plain
+        ``_save_gather_error`` is considered permanent.
+        '''
+        return HarvestGatherError.create(message, harvest_job, retryable=True)
+
+    def _save_retryable_object_error(self, message, harvest_object,
+                                     stage='Fetch', line=None):
+        '''
+        Records a fetch/import error caused by a temporary upstream failure.
+        Objects carrying a retryable error are the only ones eligible for
+        ``harvest objects requeue``, subject to the retry budget.
+        '''
+        return HarvestObjectError.create(message, harvest_object, stage=stage,
+                                         line=line, retryable=True)
+
     def _get_user_name(self):
         '''
         Returns the name of the user that will perform the harvesting actions

@@ -309,6 +309,24 @@ def abort_job(job_or_source_id_or_name):
     return "Job status: {0}".format(job["status"])
 
 
+def requeue_objects(job_id, include_gather=False):
+    """Requeue the retryable failed objects of a harvest job.
+
+    Thin wrapper around the ``harvest_objects_requeue`` action, run as the
+    site admin so it can be invoked from the CLI.
+    """
+    context = {
+        "model": model,
+        "user": _admin_user()["name"],
+        "session": model.Session,
+        "ignore_auth": True,
+    }
+    return tk.get_action("harvest_objects_requeue")(context, {
+        "id": job_id,
+        "include_gather": include_gather,
+    })
+
+
 def gather_consumer():
     import logging
     from ckanext.harvest.queue import (

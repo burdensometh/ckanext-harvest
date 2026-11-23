@@ -2,6 +2,22 @@
 
 ## [Unreleased](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...HEAD)
 
+* Gather and object errors now carry a `retryable` flag distinguishing temporary
+  upstream failures (timeouts, 429/5xx responses, connection resets) from
+  permanent ones. The CKAN harvester marks such failures automatically, and
+  custom harvesters can raise `TransientHarvestError` or use the new
+  `_save_retryable_gather_error` / `_save_retryable_object_error` helpers
+  ([#583](https://github.com/ckan/ckanext-harvest/pull/583))
+* New `harvest objects requeue` CLI command and `harvest_objects_requeue` action
+  to safely re-dispatch, within the original job's scope, only the objects that
+  failed with a retryable error. Successfully published objects, permanent
+  failures and the full error history are left untouched, and objects already in
+  the fetch queue are not duplicated ([#583](https://github.com/ckan/ckanext-harvest/pull/583))
+* New `ckan.harvest.max_retries` config option (default 5) replacing the
+  hard-coded fetch retry cap. It bounds both automatic redelivery and
+  operator-driven requeues, so a single object cannot occupy the fetch queue
+  indefinitely ([#583](https://github.com/ckan/ckanext-harvest/pull/583))
+
 ## [v1.6.3](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...v1.6.3) - 2026-08-12
 
 * The extension can now be installed via `pip install ckanext-harvest`: included requirements in pyproject.toml. To use the RabbitMQ backend, use `pip install ckanext-harvest[amqp]`.

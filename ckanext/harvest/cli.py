@@ -382,6 +382,49 @@ def reindex(ctx):
         utils.reindex()
 
 
+@harvester.command()
+@click.argument("id", metavar="JOB_ID")
+@click.option(
+    "--include-gather",
+    is_flag=True,
+    help="Also re-run the gather stage when the job has retryable gather "
+         "errors. Only allowed for jobs that produced no harvest objects, "
+         "to avoid duplicates.",
+)
+@click.pass_context
+def requeue(ctx, id, include_gather):
+    """Requeue the recoverable (temporarily failed) objects of a harvest job.
+
+    Only objects in the ERROR state whose last error is flagged retryable
+    and which have not exhausted their retry budget
+    (ckan.harvest.max_retries, default 5) are put back on the fetch queue.
+    Successfully published objects, permanent failures and error history are
+    left untouched.
+    """
+    flask_app = ctx.meta["flask_app"]
+    with flask_app.test_request_context():
+        try:
+            result = utils.requeue_objects(id, include_gather)
+        except tk.ObjectNotFound:
+            tk.error_shout(u"Job not found.")
+            ctx.abort()
+        except tk.ValidationError as e:
+            tk.error_shout(e.error_dict)
+            ctx.abort()
+
+    click.echo(
+        "Requeue summary for job {job_id}: "
+        "{requeued} requeued, {max_retries_exceeded} over retry budget, "
+        "{not_retryable} permanent failures, {already_queued} already queued"
+        .format(**result)
+    )
+    if result.get("gather_requeued"):
+        click.secho(
+            "Job {0} was put back on the gather queue".format(result["job_id"]),
+            fg="yellow",
+        )
+
+
 @harvester.command("harvesters_info")
 @click.pass_context
 def harvesters_info(ctx):

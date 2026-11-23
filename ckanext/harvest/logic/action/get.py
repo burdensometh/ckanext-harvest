@@ -177,7 +177,8 @@ def harvest_job_report(context, data_dict):
 
     for error in q.all():
         report['gather_errors'].append({
-            'message': error.message
+            'message': error.message,
+            'retryable': error.retryable,
         })
 
     # Object errors
@@ -209,7 +210,8 @@ def harvest_job_report(context, data_dict):
         report['object_errors'][error.harvest_object_id]['errors'].append({
             'message': error.message,
             'line': error.line,
-            'type': error.stage
+            'type': error.stage,
+            'retryable': error.retryable,
          })
 
     return report
