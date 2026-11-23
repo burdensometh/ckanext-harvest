@@ -12,6 +12,7 @@ import ckan.lib.helpers as h
 import ckan.plugins.toolkit as tk
 from ckan import model
 from ckantoolkit import _
+from ckantoolkit import config
 from io import StringIO
 
 from ckanext.harvest.logic import HarvestJobExists, HarvestSourceInactiveError
@@ -29,6 +30,21 @@ DATASET_TYPE_NAME = "harvest"
 def _admin_user():
     context = {"model": model, "session": model.Session, "ignore_auth": True}
     return tk.get_action("get_site_user")(context, {})
+
+
+def _read_only_user_name():
+    """Resolve a user name for read-only operations.
+
+    Unlike ``_admin_user`` this never creates the site user, so a preview
+    cannot write to the database just to build a context.
+    """
+    configured = config.get("ckanext.harvest.user_name")
+    if configured:
+        return configured
+    site_user = model.User.get(config.get("ckan.site_id"))
+    if site_user:
+        return site_user.name
+    return None
 
 
 def _print_harvest_sources(sources, output):
@@ -479,6 +495,153 @@ def clean_harvest_log():
 def harvesters_info():
     harvesters_info = tk.get_action("harvesters_info_show")()
     return harvesters_info
+
+
+def preview_harvest_objects(
+    source_id_or_name=None,
+    harvest_object_id=None,
+    guid=None,
+    config_file=None,
+    config_json=None,
+    limit=None,
+    offset=None,
+    only_current=True,
+    include_unchanged=True,
+):
+    """Run the read-only preview of the import stage for existing objects.
+
+    ``config_file`` may point at a JSON file (useful for handing the pending
+    configuration to operators without pasting it into the shell).  The file
+    is read as data only.  ``config_json`` takes precedence.
+    """
+    context = {
+        "model": model,
+        "session": model.Session,
+        "user": _read_only_user_name(),
+        "ignore_auth": True,
+    }
+
+    config_str = config_json
+    if config_str is None and config_file is not None:
+        with open(config_file, "r", encoding="utf-8") as fh:
+            config_str = fh.read()
+
+    source_id = None
+    if source_id_or_name:
+        source = tk.get_action("harvest_source_show")(context, {
+            "id": source_id_or_name
+        })
+        source_id = source["id"]
+
+    data_dict = {
+        "source_id": source_id,
+        "harvest_object_id": harvest_object_id,
+        "guid": guid,
+        "config": config_str,
+        "only_current": only_current,
+        "include_unchanged": include_unchanged,
+    }
+    if limit is not None:
+        data_dict["limit"] = limit
+    if offset is not None:
+        data_dict["offset"] = offset
+
+    return tk.get_action("harvest_objects_preview")(context, data_dict)
+
+
+def format_preview_report(report):
+    """Render a ``harvest_objects_preview`` result as plain text."""
+    output = StringIO()
+    summary = report["summary"]
+
+    print("Harvest import preview (read-only)", file=output)
+    print("", file=output)
+    print(
+        "Objects considered: {total}".format(**summary),
+        file=output,
+    )
+    print(
+        "  created: {created}\n"
+        "  updated: {updated}\n"
+        "  unchanged: {unchanged}\n"
+        "  skipped: {skipped}\n"
+        "  blocked: {blocked}\n"
+        "  error: {error}".format(**summary),
+        file=output,
+    )
+    print("", file=output)
+
+    for result in report["results"]:
+        print(
+            "[{status}] {guid} ({harvest_object_id})".format(
+                status=result.get("status", "error").upper(),
+                guid=result.get("guid"),
+                harvest_object_id=result.get("harvest_object_id"),
+            ),
+            file=output,
+        )
+        if result.get("package_name"):
+            print(
+                "  dataset: {0} ({1})".format(
+                    result.get("package_name"), result.get("package_id")),
+                file=output,
+            )
+        if result.get("reason"):
+            print("  reason: {0}".format(result["reason"]), file=output)
+        for note in result.get("notes") or []:
+            print("  note: {0}".format(note), file=output)
+
+        for change in result.get("changes") or []:
+            print(
+                "  changed {field}: {old!r} -> {new!r}".format(
+                    field=change.get("field"),
+                    old=change.get("old"),
+                    new=change.get("new"),
+                ),
+                file=output,
+            )
+
+        resources = result.get("resources") or {}
+        for resource in resources.get("added") or []:
+            print(
+                "  resource added: {url} ({format})".format(
+                    url=resource.get("url"), format=resource.get("format")),
+                file=output,
+            )
+        for resource in resources.get("removed") or []:
+            print(
+                "  resource removed: {url} ({format})".format(
+                    url=resource.get("url"), format=resource.get("format")),
+                file=output,
+            )
+        for resource in resources.get("changed") or []:
+            fields = ", ".join(
+                change["field"] for change in resource.get("changes") or []
+            )
+            print(
+                "  resource changed: {url} ({fields})".format(
+                    url=resource.get("url"), fields=fields),
+                file=output,
+            )
+
+        for removed in result.get("removed_resources") or []:
+            resource = removed.get("resource") or {}
+            print(
+                "  resource filtered out: {url} ({format}) - {reason}".format(
+                    url=resource.get("url"),
+                    format=resource.get("format"),
+                    reason=removed.get("reason"),
+                ),
+                file=output,
+            )
+
+        errors = result.get("validation_errors") or {}
+        if errors:
+            print("  validation errors: {0!r}".format(errors), file=output)
+
+        print("", file=output)
+
+    return output.getvalue()
 
 
 ###############################################################################

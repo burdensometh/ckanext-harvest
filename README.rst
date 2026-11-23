@@ -260,6 +260,7 @@ Please refer to the help message of each command for more details::
      job-abort          Marks a job as "Aborted" so that the source can be...
      job-all            Create new harvest jobs for all active sources.
      jobs               Lists harvest jobs.
+     preview            Preview re-importing existing objects with a pending...
      purge-queues       Removes all jobs from fetch and gather queue.
      reindex            Reindexes the harvest source datasets.
      run                Starts any harvest jobs that have been created by...
@@ -276,6 +277,33 @@ The commands should be run with the pyenv activated and refer to your CKAN confi
 
 
 **Note that on CKAN >= 2.9 all commands with an underscore in their name changed.** They now use a hyphen instead of an underscore (e.g. ``gather_consumer`` changed to ``gather-consumer``).
+
+Previewing a configuration change (dry run)
+-------------------------------------------
+
+Before enabling a new harvester configuration (for example new license
+defaults or resource filters) you can preview what it would do to the datasets
+that are already harvested. The ``preview`` command re-runs selection and field
+transformation on the existing harvest objects with the pending configuration,
+compares the result with the currently published record, and reports each
+object as ``created``, ``updated``, ``unchanged``, ``skipped`` or ``blocked``
+along with the concrete changes or the reason it would be blocked::
+
+    $ ckan --config=/etc/ckan/default/ckan.ini harvester preview \
+        --config-file pending.json my-harvest-source
+
+``--config-file`` (or ``--config`` for an inline JSON string) holds the
+configuration that is about to be enabled; it defaults to the source's current
+configuration. ``--all-objects`` previews the whole history instead of only the
+current object. ``--hide-unchanged`` leaves out objects that would not change.
+
+The preview is strictly read-only: it does not create or modify packages,
+groups or organizations, does not save harvest objects and does not change
+which harvest object is considered current. The same behaviour is available
+through the ``harvest_objects_preview`` API action (sysadmins only)::
+
+    $ curl -H "Authorization: $API_KEY" \
+        '{ckan_url}/api/3/action/harvest_objects_preview?source_id=SOURCE_ID'
 
 Authorization
 =============
@@ -387,6 +415,38 @@ field. The currently supported configuration options are:
 
 *   groups_filter_exclude: Exactly the same as organizations_filter_exclude but for
     groups.
+
+*   license_defaults: A dictionary with the license to apply to harvested
+    datasets. Only ``license_id`` is stored on a dataset; CKAN derives
+    ``license_title`` and ``license_url`` from it. The dictionary accepts:
+
+    * ``license_id``: the license id to use when the remote dataset has none.
+    * ``license_url``: accepted for documentation, but reported only as a
+      note because it cannot be written independently from ``license_id``.
+    * ``override``: if true, replace an existing license. Default is false
+      (only datasets without a license are filled in).
+
+*   resource_filters: A dictionary that decides which remote resources are
+    imported. It accepts ``include`` and ``exclude`` lists of rules, plus
+    shorthands:
+
+    * ``include`` / ``exclude``: lists of ``{"field": ..., "values": [...]}``
+      or ``{"field": ..., "pattern": "..."}`` rules. If ``include`` rules are
+      set, only matching resources are kept. Any resource matching an
+      ``exclude`` rule is dropped. Patterns are regular expressions matched
+      case-insensitively.
+    * ``include_formats`` / ``exclude_formats``: lists of formats, equivalent
+      to rules on ``field: format``.
+    * ``include_mimetypes`` / ``exclude_mimetypes``: the same for
+      ``field: mimetype``.
+    * ``include_url_patterns`` / ``exclude_url_patterns``: the same for
+      ``field: url``.
+
+*   dataset_filters: A dictionary with the same shape as ``resource_filters``
+    that decides which remote datasets are imported. Supported fields are
+    ``name``, ``title``, ``license_id``, ``organization``, ``owner_org``,
+    ``tags`` and ``type``. Matching datasets are skipped at the gather stage
+    and are also reported as blocked by the import preview.
 
 
 Here is an example of a configuration object (the one that must be entered in

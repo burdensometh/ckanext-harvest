@@ -1,3 +1,4 @@
+import json
 import logging
 from ckan.lib.base import config
 from sqlalchemy import or_
@@ -303,6 +304,170 @@ def harvest_object_list(context, data_dict):
     objects = query.all()
 
     return [getattr(obj, 'id') for obj in objects]
+
+
+@side_effect_free
+def harvest_objects_preview(context, data_dict):
+    '''Preview re-importing existing harvest objects with a pending config.
+
+    For every selected harvest object this runs the same transformation as
+    the import stage (without writing anything) and compares the result with
+    the record that is currently published.  It reports, per object, whether
+    it would be created, updated, left unchanged, skipped or blocked, along
+    with the concrete field/resource changes or the blocking reason.
+
+    This action is strictly read-only.  It does not create or modify
+    packages, groups or organizations, does not save harvest objects and
+    does not change which harvest object is considered current.
+
+    :param source_id: only preview objects of this harvest source (optional)
+    :type source_id: string
+    :param harvest_object_id: only preview this harvest object (optional)
+    :type harvest_object_id: string
+    :param guid: only preview objects with this guid (optional)
+    :type guid: string
+    :param config: the pending harvester configuration to use, as a JSON
+        string.  Defaults to the source's current configuration.
+    :type config: string
+    :param only_current: only preview the current object of each dataset
+        (default: True)
+    :type only_current: bool
+    :param limit: maximum number of objects to preview (optional)
+    :type limit: int
+    :param offset: number of objects to skip (default: 0)
+    :type offset: int
+    :param include_unchanged: include objects with no changes in ``results``
+        (default: True)
+    :type include_unchanged: bool
+
+    :returns: a dictionary with ``options``, ``summary`` and ``results``
+    :rtype: dictionary
+    '''
+
+    check_access('harvest_objects_preview', context, data_dict)
+
+    session = context['session']
+    source_id = data_dict.get('source_id')
+    harvest_object_id = data_dict.get('harvest_object_id')
+    guid = data_dict.get('guid')
+    config_str = data_dict.get('config')
+    only_current = p.toolkit.asbool(data_dict.get('only_current', True))
+    include_unchanged = p.toolkit.asbool(
+        data_dict.get('include_unchanged', True))
+    limit = data_dict.get('limit')
+    limit = p.toolkit.asint(limit) if limit is not None else None
+    offset = data_dict.get('offset')
+    offset = p.toolkit.asint(offset) if offset is not None else 0
+
+    query = session.query(HarvestObject)
+
+    if harvest_object_id:
+        query = query.filter(HarvestObject.id == harvest_object_id)
+    elif guid:
+        query = query.filter(HarvestObject.guid == guid)
+    elif source_id:
+        source = HarvestSource.get(source_id)
+        if not source:
+            raise NotFound('Harvest source %s does not exist' % source_id)
+        query = query.filter(HarvestObject.harvest_source_id == source.id)
+    else:
+        raise p.toolkit.ValidationError(
+            'Please provide one of "source_id", "harvest_object_id" or "guid"')
+
+    if only_current:
+        query = query.filter(HarvestObject.current == True)  # noqa: E712
+
+    query = query.order_by(HarvestObject.gathered.desc())
+    if offset:
+        query = query.offset(offset)
+    if limit:
+        query = query.limit(limit)
+
+    objects = query.all()
+
+    from ckanext.harvest.queue import get_harvester
+
+    results = []
+    summary = {
+        'total': 0,
+        'created': 0,
+        'updated': 0,
+        'unchanged': 0,
+        'skipped': 0,
+        'blocked': 0,
+        'error': 0,
+    }
+
+    option_warnings = []
+    if config_str is not None:
+        try:
+            json.loads(config_str)
+        except ValueError as exc:
+            raise p.toolkit.ValidationError(
+                'config is not valid JSON: %s' % exc)
+        if not config_str.strip() or config_str.strip() == '{}':
+            option_warnings.append(
+                'the supplied config is empty; only the base harvester '
+                'behaviour is previewed')
+
+    for obj in objects:
+        harvester = get_harvester(obj.source.type)
+        if harvester is None or not hasattr(
+                harvester, 'preview_harvest_object'):
+            summary['total'] += 1
+            summary['error'] += 1
+            results.append({
+                'harvest_object_id': obj.id,
+                'guid': obj.guid,
+                'status': 'error',
+                'reason': 'harvester %r does not support previews'
+                          % obj.source.type,
+                'notes': [],
+                'changes': [],
+                'resources': {'added': [], 'removed': [], 'changed': []},
+                'removed_resources': [],
+                'validation_errors': {},
+            })
+            continue
+
+        try:
+            result = harvester.preview_harvest_object(obj, config_str)
+        except Exception as exc:
+            log.exception('Preview failed for harvest object %s', obj.id)
+            result = {
+                'harvest_object_id': obj.id,
+                'guid': obj.guid,
+                'status': 'error',
+                'reason': 'preview failed: %s' % exc,
+                'notes': [],
+                'changes': [],
+                'resources': {'added': [], 'removed': [], 'changed': []},
+                'removed_resources': [],
+                'validation_errors': {},
+            }
+
+        summary['total'] += 1
+        status = result.get('status', 'error')
+        if status in summary:
+            summary[status] += 1
+        else:
+            summary['error'] += 1
+
+        if include_unchanged or status != 'unchanged':
+            results.append(result)
+
+    return {
+        'options': {
+            'source_id': source_id,
+            'harvest_object_id': harvest_object_id,
+            'guid': guid,
+            'only_current': only_current,
+            'config_provided': config_str is not None,
+            'warnings': option_warnings,
+        },
+        'summary': summary,
+        'results': results,
+    }
 
 
 @side_effect_free

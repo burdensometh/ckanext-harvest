@@ -393,3 +393,84 @@ def harvesters_info(ctx):
         result = utils.harvesters_info()
 
     click.echo(result)
+
+
+@harvester.command()
+@click.argument("id", metavar="SOURCE_ID_OR_NAME", required=False)
+@click.option(
+    "--config-file",
+    type=click.Path(exists=True, dir_okay=False),
+    help="JSON file with the pending harvester configuration to preview.",
+)
+@click.option(
+    "--config",
+    "config_json",
+    help="Pending harvester configuration as a JSON string.",
+)
+@click.option(
+    "-o",
+    "--harvest-object-id",
+    help="Only preview this harvest object.",
+)
+@click.option(
+    "-g",
+    "--guid",
+    help="Only preview objects with this guid.",
+)
+@click.option(
+    "--all-objects",
+    is_flag=True,
+    help="Preview every object in the history, not just the current one.",
+)
+@click.option(
+    "--limit",
+    type=int,
+    help="Maximum number of objects to preview.",
+)
+@click.option(
+    "--offset",
+    type=int,
+    help="Number of objects to skip.",
+)
+@click.option(
+    "--hide-unchanged",
+    is_flag=True,
+    help="Leave out objects that would not change.",
+)
+@click.pass_context
+def preview(ctx, id, config_file, config_json, harvest_object_id, guid,
+            all_objects, limit, offset, hide_unchanged):
+    """Preview re-importing existing objects with a pending configuration.
+
+    This performs the same selection and field transformation as the import
+    stage without writing anything: packages, groups and organizations are
+    not created or changed and no harvest object is saved.  Each object is
+    compared with the currently published record and reported as created,
+    updated, unchanged, skipped or blocked, together with the concrete
+    changes or the reason it would be blocked.
+
+    Use --config-file (or --config) to pass the configuration that is about
+    to be enabled; it defaults to the source's current configuration.
+    """
+    flask_app = ctx.meta["flask_app"]
+    with flask_app.test_request_context():
+        try:
+            report = utils.preview_harvest_objects(
+                source_id_or_name=id,
+                harvest_object_id=harvest_object_id,
+                guid=guid,
+                config_file=config_file,
+                config_json=config_json,
+                limit=limit,
+                offset=offset,
+                only_current=not all_objects,
+                include_unchanged=not hide_unchanged,
+            )
+        except tk.ObjectNotFound:
+            tk.error_shout(u"Source <{}> not found.".format(id))
+            raise click.Abort()
+        except tk.ValidationError as e:
+            tk.error_shout(u"Validation error: {}".format(e))
+            raise click.Abort()
+
+    click.echo(utils.format_preview_report(report))

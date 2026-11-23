@@ -1,6 +1,6 @@
 from ckan.plugins import toolkit as pt
 
-from ckanext.harvest.logic.auth import get_job_object
+from ckanext.harvest.logic.auth import get_job_object, user_is_sysadmin
 
 
 def auth_allow_anonymous_access(auth_function):
@@ -120,6 +120,19 @@ def harvest_object_list(context, data_dict):
     '''
     TODO: remove
     '''
+    return {'success': True}
+
+
+def harvest_objects_preview(context, data_dict):
+    '''
+        Authorization check for previewing harvest objects
+
+        Only sysadmins can do it, because the preview exposes a transformed
+        version of every harvested record, including the pending config.
+    '''
+    if not user_is_sysadmin(context):
+        return {'success': False,
+                'msg': pt._('Only sysadmins can preview harvest objects')}
     return {'success': True}
 
 

@@ -2,6 +2,9 @@
 
 ## [Unreleased](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...HEAD)
 
+* Add `license_defaults`, `resource_filters` and `dataset_filters` options to the CKAN harvester
+* Add a read-only import preview: the `harvest_objects_preview` action and the `harvester preview` CLI command, which compare existing harvest objects transformed with a pending configuration against the published datasets
+
 ## [v1.6.3](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...v1.6.3) - 2026-08-12
 
 * The extension can now be installed via `pip install ckanext-harvest`: included requirements in pyproject.toml. To use the RabbitMQ backend, use `pip install ckanext-harvest[amqp]`.
