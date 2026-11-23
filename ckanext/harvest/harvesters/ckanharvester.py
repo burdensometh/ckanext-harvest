@@ -2,8 +2,6 @@ from __future__ import absolute_import
 import requests
 from requests.exceptions import HTTPError, RequestException
 
-import datetime
-
 from urllib.parse import urlencode
 from ckan import model
 from ckan.logic import ValidationError, NotFound, get_action
@@ -25,6 +23,10 @@ class CKANHarvester(HarvesterBase):
 
     api_version = 2
     action_api_version = 3
+
+    # Remote CKAN exposes a stable ``metadata_modified`` timestamp and sorts
+    # stably by dataset id, so incremental windows can be resumed safely.
+    incremental_supported = True
 
     def _get_action_api_offset(self):
         return '/api/%d/action' % self.action_api_version
@@ -169,6 +171,15 @@ class CKANHarvester(HarvesterBase):
                     if not isinstance(config_obj[key], bool):
                         raise ValueError('%s must be boolean' % key)
 
+            if 'incremental_overlap' in config_obj:
+                try:
+                    overlap = float(config_obj['incremental_overlap'])
+                except (TypeError, ValueError):
+                    raise ValueError('incremental_overlap must be a number')
+                if overlap < 0:
+                    raise ValueError(
+                        'incremental_overlap must be a positive number')
+
         except ValueError as e:
             raise e
 
@@ -212,24 +223,31 @@ class CKANHarvester(HarvesterBase):
             fq_terms.extend(
                 '-groups:%s' % group_name for group_name in groups_filter_exclude)
 
-        # Ideally we can request from the remote CKAN only those datasets
-        # modified since the last completely successful harvest.
-        last_error_free_job = self.last_error_free_job(harvest_job)
-        log.debug('Last error-free job: %r', last_error_free_job)
-        if (last_error_free_job and
-                not self.config.get('force_all', False)):
+        # Work out the resumable incremental window. The CKAN API provides a
+        # stable ``metadata_modified`` timestamp and a stable dataset id, so
+        # we can safely resume from the last completed window. ``since`` is
+        # ``None`` on the first run (full harvest) or when ``force_all`` is
+        # set.
+        incremental_since, incremental_until = \
+            self._get_incremental_window(harvest_job)
+        self._set_incremental_window(
+            harvest_job, incremental_since, incremental_until)
+
+        if incremental_since is not None:
             get_all_packages = False
 
-            # Request only the datasets modified since
-            last_time = last_error_free_job.gather_started
-            # Note: SOLR works in UTC, and gather_started is also UTC, so
-            # this should work as long as local and remote clocks are
-            # relatively accurate. Going back a little earlier, just in case.
-            get_changes_since = \
-                (last_time - datetime.timedelta(hours=1)).isoformat()
+            get_changes_since = self._serialize_incremental_timestamp(
+                incremental_since)
             log.info('Searching for datasets modified since: %s UTC',
                      get_changes_since)
 
+            # Keep the upper end open rather than bounding it at
+            # ``incremental_until``: a record modified while this gather is
+            # running (or carrying a slightly future timestamp due to remote
+            # clock skew) must not be dropped from every subsequent window.
+            # Anything newer than ``incremental_until`` is therefore also
+            # picked up now, and because ``incremental_until`` becomes the
+            # checkpoint its (inclusive) timestamp is revisited next time.
             fq_since_last_time = 'metadata_modified:[{since}Z TO *]' \
                 .format(since=get_changes_since)
 
@@ -238,14 +256,19 @@ class CKANHarvester(HarvesterBase):
                     remote_ckan_base_url,
                     fq_terms + [fq_since_last_time])
             except SearchError as e:
+                # A failed range query must not be mistaken for "nothing
+                # changed": fall back to a full harvest, which is a superset
+                # of the window. The recorded ``incremental_until`` is still
+                # safe to advance to later, because a full harvest collects
+                # everything visible up to now.
                 log.info('Searching for datasets changed since last time '
-                         'gave an error: %s', e)
+                         'gave an error, falling back to a full harvest: %s',
+                         e)
                 get_all_packages = True
 
             if not get_all_packages and not pkg_dicts:
                 log.info('No datasets have been updated on the remote '
-                         'CKAN instance since the last harvest job %s',
-                         last_time)
+                         'CKAN instance since %s', incremental_since)
                 return []
 
         # Fall-back option - request all the datasets from the remote CKAN

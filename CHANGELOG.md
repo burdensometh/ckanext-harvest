@@ -2,6 +2,13 @@
 
 ## [Unreleased](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...HEAD)
 
+* Add resumable incremental windows for harvesters with a stable modification
+  timestamp and dataset id ordering (currently the CKAN harvester). The
+  checkpoint is only advanced once every gathered object in the window has
+  been processed, and a configurable `incremental_overlap` (default 60
+  minutes, also settable via `ckan.harvest.incremental_overlap`) re-fetches
+  records around the boundary so late-arriving updates are not missed.
+
 ## [v1.6.3](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...v1.6.3) - 2026-08-12
 
 * The extension can now be installed via `pip install ckanext-harvest`: included requirements in pyproject.toml. To use the RabbitMQ backend, use `pip install ckanext-harvest[amqp]`.

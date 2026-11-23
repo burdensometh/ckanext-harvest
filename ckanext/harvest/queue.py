@@ -449,6 +449,11 @@ def gather_stage(harvester, job):
         )
         for harvest_object in harvest_objects:
             model.Session.delete(harvest_object)
+        # The gather did not complete, so the incremental window must not be
+        # advanced: clear the recorded bounds and let the next run retry the
+        # same window.
+        job.incremental_since = None
+        job.incremental_until = None
         model.Session.commit()
         raise
     finally:

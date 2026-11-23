@@ -198,6 +198,14 @@ def harvest_source_clear(context, data_dict):
 
     model.Session.execute(sa.text(sql))
 
+    # Clearing a source wipes every harvested object, so the resumable
+    # incremental position no longer describes what has been imported. Reset
+    # it so the next run does a full harvest instead of resuming mid-window.
+    source = HarvestSource.get(harvest_source_id)
+    if source is not None and source.incremental_checkpoint is not None:
+        source.incremental_checkpoint = None
+        source.save()
+
     # Refresh the index for this source to update the status object
     get_action("harvest_source_reindex")(context, {"id": harvest_source_id})
 
@@ -577,6 +585,27 @@ def _make_scheduled_jobs(context, data_dict):
         source.save()
 
 
+def _advance_incremental_checkpoint(job_obj):
+    '''Advance the source's resumable incremental checkpoint for a finished
+    job, delegating to the harvester for the job's source type.
+
+    Harvesters that do not support incremental windows simply do nothing.
+    '''
+    for harvester in PluginImplementations(IHarvester):
+        if harvester.info()['name'] != job_obj.source.type:
+            continue
+        advance = getattr(harvester, 'advance_incremental_checkpoint', None)
+        if advance is None:
+            return
+        try:
+            advance(job_obj)
+        except Exception:
+            log.exception(
+                'Error while advancing incremental checkpoint for job %s',
+                job_obj.id)
+        return
+
+
 def harvest_jobs_run(context, data_dict):
     '''
     Runs scheduled jobs, checks if any jobs need marking as finished, and
@@ -664,6 +693,12 @@ def harvest_jobs_run(context, data_dict):
                     else:
                         job_obj.finished = job['gather_finished']
                     job_obj.save()
+
+                    # Advance the resumable incremental checkpoint, but only
+                    # if every object gathered for the window was processed
+                    # successfully. Errored or in-flight objects leave the
+                    # position untouched so the window is retried.
+                    _advance_incremental_checkpoint(job_obj)
 
                     # Reindex the harvest source dataset so it has the latest
                     # status

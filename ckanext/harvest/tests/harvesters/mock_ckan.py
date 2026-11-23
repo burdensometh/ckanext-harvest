@@ -187,7 +187,11 @@ class MockCkanHandler(SimpleHTTPRequestHandler):
 
 
 def serve(port=PORT):
-    '''Runs a CKAN-alike app (over HTTP) that is used for harvesting tests'''
+    '''Runs a CKAN-alike app (over HTTP) that is used for harvesting tests.
+
+    Safe to call more than once: if the server is already listening on the
+    port (another test module started it) this is a no-op.
+    '''
 
     # Choose the directory to serve files from
     # os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -196,7 +200,11 @@ def serve(port=PORT):
     class TestServer(TCPServer):
         allow_reuse_address = True
 
-    httpd = TestServer(("", PORT), MockCkanHandler)
+    try:
+        httpd = TestServer(("", PORT), MockCkanHandler)
+    except OSError:
+        # Already being served by another test module.
+        return
 
     print('Serving test HTTP server at port {}'.format(PORT))
 

@@ -87,6 +87,17 @@ groups:
           no timeout on harvest jobs.
         example: 1440
 
+      - key: ckan.harvest.incremental_overlap
+        type: int
+        default: 60
+        description: |
+          Default look-back overlap (in minutes) applied when resuming an
+          incremental harvest from a completed window. It can be overridden
+          per source with the `incremental_overlap` harvester config option.
+          A larger value re-fetches more already-seen records, which protects
+          against updates that arrive late on the remote side.
+        example: 180
+
       - key: ckan.harvest.status_mail.all
         type: bool
         default: false

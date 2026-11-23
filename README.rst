@@ -348,6 +348,24 @@ field. The currently supported configuration options are:
     Setting this property to true will force the harvester to gather all remote
     packages regardless of the modification date. Default is False.
 
+*   incremental_overlap: How many minutes to look back before the stored
+    incremental position when resuming a harvest of a CKAN source. Remote
+    catalogs sometimes publish updates late, and a record's
+    ``metadata_modified`` may be older than the moment it becomes visible, so
+    a small overlap re-fetches recently seen records to avoid missing them.
+    Defaults to 60 minutes. It can also be set globally with the
+    ``ckan.harvest.incremental_overlap`` option.
+
+    For harvesters whose source exposes a stable modification timestamp and a
+    stable dataset id ordering (such as this CKAN harvester), the harvest is
+    resumable: the position (checkpoint) is only advanced once every record
+    gathered for a window has been processed successfully. If any record
+    fails, the position is left untouched and the same window is requested
+    again on the next run, so failures are retried and records sharing the
+    boundary timestamp are always collected. The first run (and any run after
+    the source is cleared) has no checkpoint yet, so it performs a full
+    harvest and then establishes the initial position.
+
 *   remote_groups: By default, remote groups are ignored. Setting this property
     enables the harvester to import the remote groups. There are two alternatives.
     Setting it to 'only_local' will just import groups which name/id is already

@@ -77,6 +77,11 @@ class HarvestSource(BaseModel, HarvestDomainObject):
     publisher_id = Column(types.UnicodeText, default="")
     frequency = Column(types.UnicodeText, default="MANUAL")
     next_run = Column(types.DateTime)
+    # Upper bound of the last fully processed incremental window. Harvesters
+    # that support stable modification times and id ordering (eg the CKAN
+    # harvester) use this as their resumable position. It is only advanced
+    # once every object gathered for a window has been processed.
+    incremental_checkpoint = Column(types.DateTime, nullable=True)
     jobs = relationship(
         "HarvestJob",
         lazy="select",
@@ -128,6 +133,11 @@ class HarvestJob(BaseModel, HarvestDomainObject):
     source_id = Column(types.UnicodeText, ForeignKey("harvest_source.id"))
     # status: New, Running, Finished
     status = Column(types.UnicodeText, default="New", nullable=False)
+    # Bounds of the incremental window this job gathered, if any. They are
+    # persisted so that the checkpoint can be advanced at completion time
+    # only for windows whose objects were all processed successfully.
+    incremental_since = Column(types.DateTime, nullable=True)
+    incremental_until = Column(types.DateTime, nullable=True)
     source = relationship(
         "HarvestSource",
         lazy="select",

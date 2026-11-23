@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import datetime
 import logging
 import re
 import uuid
@@ -27,6 +28,18 @@ from ckanext.harvest.logic.schema import unicode_safe
 
 log = logging.getLogger(__name__)
 
+# Default look-back applied when resuming an incremental harvest. Existing
+# installations worked with a hard-coded one hour, so keep that as the default
+# while allowing it to be configured per source (``incremental_overlap``) or
+# globally (``ckan.harvest.incremental_overlap``).
+DEFAULT_INCREMENTAL_OVERLAP_MINUTES = 60
+
+# A small fixed margin on top of the configured overlap. Timestamps coming
+# from the remote search index may have a different precision (or clock skew)
+# than the checkpoint we store, so moving the lower bound a bit earlier
+# guarantees that records sharing the boundary timestamp are not skipped.
+INCREMENTAL_SAFETY_MARGIN = datetime.timedelta(seconds=1)
+
 
 class HarvesterBase(SingletonPlugin):
     '''
@@ -41,6 +54,12 @@ class HarvesterBase(SingletonPlugin):
     config = None
 
     _user_name = None
+
+    # Harvesters whose source exposes a stable modification timestamp and a
+    # stable dataset id ordering can set this to True. They then get a
+    # resumable incremental window: the position is only advanced once every
+    # harvested object in the window has been processed successfully.
+    incremental_supported = False
 
     @classmethod
     def _gen_new_name(cls, title, existing_name=None,
@@ -147,6 +166,195 @@ class HarvesterBase(SingletonPlugin):
 
     _save_gather_error = HarvestGatherError.create
     _save_object_error = HarvestObjectError.create
+
+    # ------------------------------------------------------------------
+    # Resumable incremental windows
+    # ------------------------------------------------------------------
+
+    def _get_incremental_overlap(self):
+        '''Return the overlap (as a ``timedelta``) to apply when resuming an
+        incremental harvest.
+
+        The overlap re-fetches records whose modification timestamp falls
+        slightly before the stored checkpoint, so that updates which arrive
+        late on the remote side (or whose ``metadata_modified`` is older than
+        the moment they became visible) are not missed.
+
+        It can be configured per source with the ``incremental_overlap`` key
+        in the harvester config (in minutes) or globally with the
+        ``ckan.harvest.incremental_overlap`` option. When neither is set the
+        historical one-hour look-back is used.
+        '''
+        overlap = None
+        if self.config:
+            overlap = self.config.get('incremental_overlap')
+        if overlap is None:
+            overlap = config.get('ckan.harvest.incremental_overlap')
+        if overlap is None:
+            overlap = DEFAULT_INCREMENTAL_OVERLAP_MINUTES
+
+        try:
+            overlap_minutes = float(overlap)
+        except (TypeError, ValueError):
+            log.warning(
+                'Invalid incremental overlap %r, falling back to %s minutes',
+                overlap, DEFAULT_INCREMENTAL_OVERLAP_MINUTES)
+            overlap_minutes = DEFAULT_INCREMENTAL_OVERLAP_MINUTES
+
+        if overlap_minutes < 0:
+            log.warning(
+                'Negative incremental overlap %r, using 0 instead', overlap)
+            overlap_minutes = 0
+
+        return datetime.timedelta(minutes=overlap_minutes)
+
+    @classmethod
+    def _serialize_incremental_timestamp(cls, value):
+        '''Serialize a datetime for use in a Solr range query.
+
+        CKAN archives ``metadata_modified`` in UTC. Naive datetimes coming
+        from the database are therefore assumed to be UTC already.
+        '''
+        if value is None:
+            return None
+        if value.tzinfo is not None:
+            value = value.astimezone(datetime.timezone.utc).replace(
+                tzinfo=None)
+        # Solr expects a trailing ``Z`` and understands microseconds.
+        return value.isoformat()
+
+    def _get_incremental_window(self, harvest_job, now=None):
+        '''Compute the incremental window for a job.
+
+        Returns a ``(since, until)`` tuple of naive UTC datetimes, or
+        ``(None, None)`` when the harvester cannot use an incremental window
+        (either because the source type does not support it or because
+        ``force_all`` is set).
+
+        ``since`` is ``None`` for the first run (there is no checkpoint yet),
+        meaning a full harvest is performed. On later runs ``since`` is the
+        stored checkpoint moved back by the configured overlap plus a safety
+        margin, so that records sharing the boundary timestamp (or arriving
+        late) are included.
+
+        ``until`` is the upper bound captured at the start of the gather
+        stage. It is persisted on the job and only becomes the new checkpoint
+        once every object gathered for the window has been processed.
+        '''
+        if not self.incremental_supported:
+            return None, None
+
+        until = now or datetime.datetime.utcnow()
+        checkpoint = getattr(harvest_job.source, 'incremental_checkpoint',
+                             None)
+
+        if self.config and self.config.get('force_all', False):
+            # A forced full harvest still establishes/advances the
+            # checkpoint once every gathered object has been processed.
+            return None, until
+
+        if checkpoint is None:
+            # No completed window yet - behave like the historical full run,
+            # but remember ``until`` so a checkpoint can be established.
+            return None, until
+
+        since = checkpoint - self._get_incremental_overlap() \
+            - INCREMENTAL_SAFETY_MARGIN
+
+        if since >= until:
+            # Defensive: never produce an empty or inverted window because of
+            # clock skew between the checkpoint and ``until``.
+            since = until - INCREMENTAL_SAFETY_MARGIN
+
+        return since, until
+
+    def _set_incremental_window(self, harvest_job, since, until):
+        '''Record the window bounds on the job so the checkpoint can be
+        advanced (or not) when the job finishes.
+
+        The values are only set on the in-memory object; the caller (usually
+        :func:`ckanext.harvest.queue.gather_stage`) persists the job when the
+        gather stage completes. This avoids committing a half-finished gather
+        just to store the bounds.
+        '''
+        if not self.incremental_supported:
+            return
+        harvest_job.incremental_since = since
+        harvest_job.incremental_until = until
+
+    @staticmethod
+    def _job_incremental_complete(harvest_job):
+        '''Return True when every object gathered for the job's window has
+        been processed successfully.
+
+        Only objects in the ``COMPLETE`` state count as done. Objects still
+        in flight (``WAITING``/``FETCH``/``IMPORT``) or that ended in
+        ``ERROR`` keep the window open, so the next run will request the same
+        window again and re-collect the records that failed.
+        '''
+        unfinished = (
+            model.Session.query(HarvestObject.id)
+            .filter(HarvestObject.harvest_job_id == harvest_job.id)
+            .filter(HarvestObject.state != 'COMPLETE')
+            .count()
+        )
+        return unfinished == 0
+
+    def advance_incremental_checkpoint(self, harvest_job):
+        '''Advance the source checkpoint if the job's window is complete.
+
+        This is called when a job is finished. It only moves the checkpoint
+        forward when:
+
+        * the job actually gathered an incremental window, and
+        * every object in that window was processed successfully
+          (``COMPLETE``), and
+        * the job finished without gather errors (an aborted gather means we
+          cannot know which records were seen).
+
+        An object that ended in ``ERROR`` keeps the window open on purpose:
+        the position is only advanced once the whole window has been processed
+        successfully, so a failure in any single object leaves the position
+        where it was. The next run re-requests the same window (with the
+        overlap) and collects the failed records again.
+
+        :returns: the new checkpoint (or ``None`` if it was not advanced)
+        '''
+        if not self.incremental_supported:
+            return None
+
+        until = getattr(harvest_job, 'incremental_until', None)
+        if until is None:
+            return None
+
+        if not self._job_incremental_complete(harvest_job):
+            log.info(
+                'Not advancing incremental checkpoint for job %s: objects '
+                'still pending', harvest_job.id)
+            return None
+
+        if harvest_job.gather_errors:
+            log.info(
+                'Not advancing incremental checkpoint for job %s: gather '
+                'errors present', harvest_job.id)
+            return None
+
+        source = harvest_job.source
+        if source is None:
+            log.warning(
+                'Cannot advance incremental checkpoint for job %s: source '
+                'is missing', harvest_job.id)
+            return None
+        current = getattr(source, 'incremental_checkpoint', None)
+        if current is not None and current >= until:
+            return current
+
+        source.incremental_checkpoint = until
+        source.save()
+        log.info(
+            'Advanced incremental checkpoint for source %s to %s',
+            source.id, until)
+        return until
 
     def _get_user_name(self):
         '''
