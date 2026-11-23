@@ -8,6 +8,7 @@ from urllib.parse import urlencode
 from ckan import model
 from ckan.logic import ValidationError, NotFound, get_action
 from ckan.lib.helpers import json
+from ckan.model.types import make_uuid
 from ckan.plugins import toolkit
 
 from ckanext.harvest.model import HarvestObject
@@ -88,6 +89,20 @@ class CKANHarvester(HarvesterBase):
             log.debug('Using config: %r', self.config)
         else:
             self.config = {}
+
+    @staticmethod
+    def _guid_for_remote_id(harvest_source_id, remote_id):
+        '''
+        Returns the identity (guid) of a remote dataset, unique within the
+        whole local CKAN rather than within the remote instance.
+
+        Two different harvest sources may expose datasets that share the same
+        remote id, so the remote id on its own is not a safe identity. Prefixing
+        it with the harvest source id guarantees that datasets coming from
+        different sources never collide, while remaining stable across
+        successive harvests of the same source.
+        '''
+        return '%s:%s' % (harvest_source_id, remote_id)
 
     def info(self):
         return {
@@ -282,9 +297,11 @@ class CKANHarvester(HarvesterBase):
 
                 log.debug('Creating HarvestObject for %s %s',
                           pkg_dict['name'], pkg_dict['id'])
-                obj = HarvestObject(guid=pkg_dict['id'],
-                                    job=harvest_job,
-                                    content=json.dumps(pkg_dict))
+                obj = HarvestObject(
+                    guid=self._guid_for_remote_id(harvest_job.source.id,
+                                                  pkg_dict['id']),
+                    job=harvest_job,
+                    content=json.dumps(pkg_dict))
                 obj.save()
                 object_ids.append(obj.id)
 
@@ -371,6 +388,71 @@ class CKANHarvester(HarvesterBase):
         # Nothing to do here - we got the package dict in the search in the
         # gather stage
         return True
+
+    def _find_local_package_id(self, harvest_object, remote_id):
+        '''
+        Resolves the id of the local package that this harvest object maps to,
+        maintaining a stable local identity that is independent of the remote
+        dataset id.
+
+        Remote CKAN instances are free to reuse the same dataset id for
+        different datasets, so the remote id cannot be used as the local
+        package id. The mapping (harvest source, remote dataset id) -> local
+        package id is persisted on the harvest objects themselves:
+
+        * New style objects carry a source-scoped guid
+          (``<source_id>:<remote_id>``), unique across all sources.
+        * Objects created by older versions of the harvester carry the bare
+          remote id as guid. Those are only accepted when they belong to this
+          same harvest source, so a dataset imported from another source can
+          never be claimed. When no existing mapping is found a fresh local id
+          is generated, meaning colliding datasets from different sources are
+          always published as distinct local packages.
+
+        Once a local package id has been assigned to a (source, remote id)
+        pair, every subsequent harvest reuses it, so updates always land on the
+        same package and can never modify the package owned by another source.
+        '''
+        session = model.Session
+
+        def package_is_live(package_id):
+            if not package_id:
+                return False
+            return session.query(model.Package.id).filter(
+                model.Package.id == package_id,
+                model.Package.state != 'deleted').first() is not None
+
+        # 1. Current mapping: objects created with the source-scoped guid.
+        existing_object = session.query(HarvestObject).filter(
+            HarvestObject.harvest_source_id == harvest_object.source.id,
+            HarvestObject.guid == harvest_object.guid,
+            HarvestObject.package_id.isnot(None)).order_by(
+                HarvestObject.import_finished.desc()).first()
+        if existing_object and package_is_live(existing_object.package_id):
+            log.debug('Remote dataset %s maps to existing local package %s '
+                      'via source-scoped guid %s',
+                      remote_id, existing_object.package_id,
+                      harvest_object.guid)
+            return existing_object.package_id, False
+
+        # 2. Legacy mapping: harvest objects created before guids were scoped
+        #    per source. Only trust records that this same source imported, so
+        #    another source's package can never be taken over.
+        legacy_object = session.query(HarvestObject).filter(
+            HarvestObject.harvest_source_id == harvest_object.source.id,
+            HarvestObject.guid == remote_id,
+            HarvestObject.package_id.isnot(None)).order_by(
+                HarvestObject.import_finished.desc()).first()
+        if legacy_object and package_is_live(legacy_object.package_id):
+            log.info('Reusing local package %s for remote dataset %s from a '
+                     'legacy (pre-source-scoped) harvest object of source %s',
+                     legacy_object.package_id, remote_id,
+                     harvest_object.source.id)
+            return legacy_object.package_id, False
+
+        # 3. No usable mapping: the dataset is new to this source. Generate a
+        #    fresh local identity instead of reusing the remote id.
+        return make_uuid(), True
 
     def import_stage(self, harvest_object):
         log.debug('In CKANHarvester import_stage')
@@ -546,6 +628,24 @@ class CKANHarvester(HarvesterBase):
                 resource.pop('revision_id', None)
 
             package_dict = self.modify_package_dict(package_dict, harvest_object)
+
+            # Resolve the local package identity through the stable mapping for
+            # this (source, remote dataset) pair. The remote id must not be
+            # used directly: different sources may expose colliding ids for
+            # different datasets, which would otherwise make one source
+            # overwrite the other source's package.
+            remote_id = package_dict['id']
+            local_package_id, is_new_package = self._find_local_package_id(
+                harvest_object, remote_id)
+            package_dict['id'] = local_package_id
+
+            if is_new_package:
+                # A brand new local package must not inherit remote resource
+                # ids either: another source may already have a resource with
+                # the same id, and reusing it would silently move that resource
+                # onto this package. Let CKAN mint fresh local resource ids.
+                for resource in package_dict.get('resources', []):
+                    resource.pop('id', None)
 
             result = self._create_or_update_package(
                 package_dict, harvest_object, package_dict_form='package_show')

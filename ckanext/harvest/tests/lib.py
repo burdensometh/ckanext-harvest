@@ -1,3 +1,4 @@
+import json
 import logging
 
 from ckanext.harvest.tests.factories import HarvestSourceObj, HarvestJobObj
@@ -46,6 +47,16 @@ def run_harvest_job(job, harvester):
         harvest_object = harvest_model.HarvestObject.get(obj_id)
         guid = harvest_object.guid
 
+        # Index results by the remote dataset id (stored in the object
+        # content), rather than the source-scoped guid, so tests can refer to
+        # datasets by their remote identity. Fall back to the guid for
+        # harvesters whose content does not include an id.
+        try:
+            remote_id = json.loads(harvest_object.content)['id']
+            result_key = remote_id
+        except (TypeError, ValueError, KeyError):
+            result_key = guid
+
         # force reimport of datasets
         if hasattr(job, 'force_import'):
             if guid in job.force_import:
@@ -54,17 +65,17 @@ def run_harvest_job(job, harvester):
                 log.info('Skipping: %s', guid)
                 continue
 
-        results_by_guid[guid] = {'obj_id': obj_id}
+        results_by_guid[result_key] = {'obj_id': obj_id, 'guid': guid}
 
         queue.fetch_and_import_stages(harvester, harvest_object)
-        results_by_guid[guid]['state'] = harvest_object.state
-        results_by_guid[guid]['report_status'] = harvest_object.report_status
+        results_by_guid[result_key]['state'] = harvest_object.state
+        results_by_guid[result_key]['report_status'] = harvest_object.report_status
         if harvest_object.state == 'COMPLETE' and harvest_object.package_id:
-            results_by_guid[guid]['dataset'] = \
+            results_by_guid[result_key]['dataset'] = \
                 toolkit.get_action('package_show')(
                     {'ignore_auth': True},
                     dict(id=harvest_object.package_id))
-        results_by_guid[guid]['errors'] = harvest_object.errors
+        results_by_guid[result_key]['errors'] = harvest_object.errors
 
     # Do 'harvest_jobs_run' to change the job status to 'finished'
     toolkit.get_action('harvest_jobs_run')({'ignore_auth': True}, {})

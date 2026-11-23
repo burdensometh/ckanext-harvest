@@ -52,7 +52,11 @@ class TestCkanHarvester(object):
         assert isinstance(obj_ids, list)
         assert len(obj_ids) == len(mock_ckan.DATASETS)
         harvest_object = harvest_model.HarvestObject.get(obj_ids[0])
-        assert harvest_object.guid == mock_ckan.DATASETS[0]['id']
+        # The guid is scoped to the harvest source, so the same remote id
+        # exposed by another source gets a distinct identity.
+        assert harvest_object.guid == CKANHarvester._guid_for_remote_id(
+            source.id, mock_ckan.DATASETS[0]['id'])
+        assert harvest_object.guid.endswith(':%s' % mock_ckan.DATASETS[0]['id'])
         assert json.loads(harvest_object.content) == mock_ckan.DATASETS[0]
 
     def test_fetch_normal(self):
@@ -82,6 +86,9 @@ class TestCkanHarvester(object):
         assert harvest_object.errors == []
         assert result is True
         assert harvest_object.package_id
+        # The local package gets a stable local identity, distinct from the
+        # remote dataset id so it cannot collide with another source's package.
+        assert harvest_object.package_id != mock_ckan.DATASETS[0]['id']
         dataset = model.Package.get(harvest_object.package_id)
         assert dataset.name == mock_ckan.DATASETS[0]['name']
 
@@ -181,7 +188,8 @@ class TestCkanHarvester(object):
         assert 'dataset1-id' in results_by_guid
 
         # Check that the dataset extras has the harvest_object_id, harvest_source_id, and harvest_source_title
-        dataset = call_action('package_show', {"for_view": True}, id=mock_ckan.DATASETS[0]['id'])
+        local_package_id = results_by_guid[mock_ckan.DATASETS[0]['id']]['dataset']['id']
+        dataset = call_action('package_show', {"for_view": True}, id=local_package_id)
         extras_dict = dict((e['key'], e['value']) for e in dataset['extras'])
         assert 'harvest_object_id' in extras_dict
         assert 'harvest_source_id' in extras_dict
@@ -199,7 +207,8 @@ class TestCkanHarvester(object):
         assert 'dataset1-id' in results_by_guid
 
         # Check that the dataset was added to the existing local group
-        dataset = call_action('package_show', {}, id=mock_ckan.DATASETS[0]['id'])
+        local_package_id = results_by_guid[mock_ckan.DATASETS[0]['id']]['dataset']['id']
+        dataset = call_action('package_show', {}, id=local_package_id)
         assert dataset['groups'][0]['id'] == mock_ckan.DATASETS[0]['groups'][0]['id']
 
         # Check that the other remote group was not created locally

@@ -2,6 +2,8 @@
 
 ## [Unreleased](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...HEAD)
 
+* CKAN harvester: source-scope the harvest object guid (`<source_id>:<remote_id>`) and keep a stable per-source mapping to local packages, so two sources exposing datasets with the same remote id are now published and updated as distinct packages instead of one overwriting the other. Local packages get generated ids and new packages no longer inherit remote resource ids.
+
 ## [v1.6.3](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...v1.6.3) - 2026-08-12
 
 * The extension can now be installed via `pip install ckanext-harvest`: included requirements in pyproject.toml. To use the RabbitMQ backend, use `pip install ckanext-harvest[amqp]`.
