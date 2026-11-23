@@ -2,6 +2,14 @@
 
 ## [Unreleased](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...HEAD)
 
+* Preserve local resource identity when harvesting from a CKAN source. Local
+  resources are now matched to their remote counterparts by the remote
+  resource id (stored in the `harvest_remote_resource_id` resource extra), so
+  local ids survive URL, description or ordering changes on the remote.
+  Distinct remote resources sharing a URL keep separate local resources, and
+  resources removed from the remote are marked as deleted locally without
+  disturbing the others.
+
 ## [v1.6.3](https://github.com/ckan/ckanext-harvest/compare/v1.6.3...v1.6.3) - 2026-08-12
 
 * The extension can now be installed via `pip install ckanext-harvest`: included requirements in pyproject.toml. To use the RabbitMQ backend, use `pip install ckanext-harvest[amqp]`.

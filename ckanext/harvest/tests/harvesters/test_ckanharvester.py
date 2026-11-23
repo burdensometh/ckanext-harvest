@@ -17,7 +17,7 @@ from ckan.plugins import toolkit
 from ckanext.harvest.harvesters.ckanharvester import ContentFetchError
 from ckanext.harvest.tests.factories import (HarvestSourceObj, HarvestJobObj,
                                              HarvestObjectObj)
-from ckanext.harvest.tests.lib import run_harvest
+from ckanext.harvest.tests.lib import run_harvest, run_harvest_job
 import ckanext.harvest.model as harvest_model
 from ckanext.harvest.harvesters.base import HarvesterBase
 from ckanext.harvest.harvesters.ckanharvester import CKANHarvester
@@ -357,3 +357,181 @@ class TestCkanHarvester(object):
             harvester._get_content("http://test.example.gov.uk")
 
         assert str(context.value) == 'HTTP error: 404 http://test.example.gov.uk'
+
+
+def _resource(remote_id, url, description=None, position=0):
+    resource = {
+        'id': remote_id,
+        'url': url,
+        'format': 'CSV',
+        'name': remote_id,
+        'position': position,
+    }
+    if description is not None:
+        resource['description'] = description
+    return resource
+
+
+def _harvest_round(source, resources, metadata_modified=None):
+    '''Run a harvest job for the mock CKAN serving ``resources`` on the
+    second dataset, returning the harvest result for that dataset.'''
+    datasets = copy.deepcopy(mock_ckan.DATASETS)
+    datasets[1]['resources'] = resources
+    if metadata_modified is not None:
+        datasets[1]['metadata_modified'] = metadata_modified
+
+    job = HarvestJobObj(source=source, run=False)
+    with patch('ckanext.harvest.tests.harvesters.mock_ckan.DATASETS', datasets):
+        results = run_harvest_job(job, CKANHarvester())
+    return results[datasets[1]['id']]
+
+
+def _get_resources_by_remote_id(dataset):
+    return {
+        resource['harvest_remote_resource_id']: resource
+        for resource in dataset['resources']
+    }
+
+
+@pytest.mark.usefixtures('with_plugins', 'clean_db', 'clean_index')
+class TestResourceIdentity(object):
+    '''Resources must keep their local identity across harvests, matched by
+    their stable remote resource id rather than by position or URL.'''
+
+    def _source(self):
+        return HarvestSourceObj(url='http://localhost:%s/' % mock_ckan.PORT)
+
+    def _dataset(self):
+        return call_action('package_show', {}, id=mock_ckan.DATASETS[1]['id'])
+
+    def test_remote_resource_id_stored_on_import(self):
+        result = _harvest_round(self._source(), [
+            _resource('remote-a', 'http://example.com/a.csv'),
+            _resource('remote-b', 'http://example.com/b.csv', position=1),
+        ])
+        assert result['errors'] == []
+
+        resources = _get_resources_by_remote_id(self._dataset())
+        assert set(resources) == {'remote-a', 'remote-b'}
+        # Local ids are generated, and are not the remote (non UUID) ids.
+        assert resources['remote-a']['id'] != 'remote-a'
+        assert resources['remote-b']['id'] != 'remote-b'
+
+    def test_id_preserved_when_url_and_description_change(self):
+        _harvest_round(self._source(), [
+            _resource('remote-a', 'http://example.com/a.csv', 'A'),
+        ])
+        local_id = _get_resources_by_remote_id(self._dataset())['remote-a']['id']
+
+        _harvest_round(self._source(), [
+            _resource('remote-a', 'http://example.com/a-v2.csv', 'A updated'),
+        ], metadata_modified='2050-05-09T22:00:01.486366')
+
+        resource = _get_resources_by_remote_id(self._dataset())['remote-a']
+        assert resource['id'] == local_id
+        assert resource['url'] == 'http://example.com/a-v2.csv'
+        assert resource['description'] == 'A updated'
+
+    def test_id_preserved_when_resources_reordered(self):
+        _harvest_round(self._source(), [
+            _resource('remote-a', 'http://example.com/a.csv', position=0),
+            _resource('remote-b', 'http://example.com/b.csv', position=1),
+        ])
+        ids = {
+            remote_id: resource['id']
+            for remote_id, resource in
+            _get_resources_by_remote_id(self._dataset()).items()
+        }
+
+        _harvest_round(self._source(), [
+            _resource('remote-b', 'http://example.com/b.csv', position=0),
+            _resource('remote-a', 'http://example.com/a.csv', position=1),
+        ], metadata_modified='2050-05-09T22:00:01.486366')
+
+        resources = _get_resources_by_remote_id(self._dataset())
+        assert resources['remote-a']['id'] == ids['remote-a']
+        assert resources['remote-b']['id'] == ids['remote-b']
+        assert resources['remote-a']['position'] == 1
+        assert resources['remote-b']['position'] == 0
+
+    def test_ids_distinct_when_two_resources_share_a_url(self):
+        _harvest_round(self._source(), [
+            _resource('remote-a', 'http://example.com/a.csv'),
+        ])
+        id_a = _get_resources_by_remote_id(self._dataset())['remote-a']['id']
+
+        _harvest_round(self._source(), [
+            _resource('remote-a', 'http://example.com/shared.csv', 'A', 0),
+            _resource('remote-b', 'http://example.com/shared.csv', 'B', 1),
+        ], metadata_modified='2051-05-09T22:00:01.486366')
+
+        dataset = self._dataset()
+        resources = _get_resources_by_remote_id(dataset)
+        assert resources['remote-a']['id'] == id_a
+        assert resources['remote-b']['id'] != id_a
+        assert resources['remote-a']['description'] == 'A'
+        assert resources['remote-b']['description'] == 'B'
+
+    def test_removed_remote_resource_does_not_affect_others(self):
+        _harvest_round(self._source(), [
+            _resource('remote-a', 'http://example.com/a.csv', position=0),
+            _resource('remote-b', 'http://example.com/b.csv', position=1),
+        ])
+        ids = {
+            remote_id: resource['id']
+            for remote_id, resource in
+            _get_resources_by_remote_id(self._dataset()).items()
+        }
+
+        _harvest_round(self._source(), [
+            _resource('remote-b', 'http://example.com/b.csv', position=0),
+        ], metadata_modified='2052-05-09T22:00:01.486366')
+
+        dataset = self._dataset()
+        resources = _get_resources_by_remote_id(dataset)
+        assert set(resources) == {'remote-b'}
+        assert resources['remote-b']['id'] == ids['remote-b']
+
+    def test_local_id_preserved_for_legacy_harvested_resources(self):
+        '''Resources harvested before the remote id was tracked used the
+        remote id as their local id. They must keep that id (and gain the
+        mapping extra) on the next harvest.'''
+        remote_id = '11111111-1111-1111-1111-111111111111'
+        # Simulate the legacy state: a package already exists whose resource
+        # uses the remote resource UUID as its local id, without the mapping
+        # extra.
+        call_action('package_create', {}, **{
+            'id': mock_ckan.DATASETS[1]['id'],
+            'name': 'legacy-dataset',
+            'resources': [
+                _resource(remote_id, 'http://example.com/legacy-v1.csv'),
+            ],
+        })
+
+        _harvest_round(self._source(), [
+            _resource(remote_id, 'http://example.com/legacy-v2.csv', 'Legacy v2'),
+        ], metadata_modified='2050-05-09T22:00:01.486366')
+
+        resources = _get_resources_by_remote_id(self._dataset())
+        assert resources[remote_id]['id'] == remote_id
+        assert resources[remote_id]['url'] == 'http://example.com/legacy-v2.csv'
+
+    def test_resource_reintroduced_gets_new_local_id(self):
+        _harvest_round(self._source(), [
+            _resource('remote-a', 'http://example.com/a.csv'),
+            _resource('remote-b', 'http://example.com/b.csv', position=1),
+        ])
+        old_id_a = _get_resources_by_remote_id(self._dataset())['remote-a']['id']
+
+        _harvest_round(self._source(), [
+            _resource('remote-b', 'http://example.com/b.csv'),
+        ], metadata_modified='2052-05-09T22:00:01.486366')
+
+        _harvest_round(self._source(), [
+            _resource('remote-a', 'http://example.com/a.csv', position=0),
+            _resource('remote-b', 'http://example.com/b.csv', position=1),
+        ], metadata_modified='2053-05-09T22:00:01.486366')
+
+        resources = _get_resources_by_remote_id(self._dataset())
+        # The old local resource was deleted, so it must not be reused.
+        assert resources['remote-a']['id'] != old_id_a

@@ -234,6 +234,21 @@ For example, in case you want to retain changes made by the users to the fields 
     ckan.harvest.not_overwrite_fields = description tags
 
 
+Resource identity
+=================
+
+When harvesting from a CKAN source, resources on the local instance are
+matched to their remote counterparts by the remote resource id. This id is
+stored in the ``harvest_remote_resource_id`` extra of each local resource, so
+a local resource keeps its id (and any local reference to it, e.g. a
+datastore table or a resource view) even when the remote republishes it with a
+different download URL or description, or reorders the resources of a dataset.
+
+Two distinct remote resources that share the same URL are still kept as
+separate local resources, and a resource removed from the remote is marked as
+deleted locally without affecting the remaining ones.
+
+
 Command line interface
 ======================
 

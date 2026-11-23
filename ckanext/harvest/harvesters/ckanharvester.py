@@ -3,6 +3,7 @@ import requests
 from requests.exceptions import HTTPError, RequestException
 
 import datetime
+import uuid
 
 from urllib.parse import urlencode
 from ckan import model
@@ -25,6 +26,14 @@ class CKANHarvester(HarvesterBase):
 
     api_version = 2
     action_api_version = 3
+
+    # Key used to store, in the extras of each local resource, the id that the
+    # resource has on the remote CKAN. It is what allows a resource to be
+    # matched with its local counterpart on later harvests, so that the local
+    # resource keeps its identity (and any local reference to its id keeps
+    # working) when the remote republishes it with a different download URL,
+    # description or position.
+    remote_resource_id_extra = 'harvest_remote_resource_id'
 
     def _get_action_api_offset(self):
         return '/api/%d/action' % self.action_api_version
@@ -372,6 +381,78 @@ class CKANHarvester(HarvesterBase):
         # gather stage
         return True
 
+    def _assign_local_resource_ids(self, package_dict):
+        '''Return the resources to save locally, keeping their local identity.
+
+        A remote CKAN resource has an id that is stable across harvests, even
+        when the resource is republished (eg the download URL or the
+        description change). Local resources are matched to remote ones using
+        that id, kept in the ``harvest_remote_resource_id`` extra of each
+        local resource. Matching by position or URL alone is not enough: the
+        remote can reorder resources, and two distinct resources can share the
+        same URL. Storing the remote id lets each local resource keep its
+        identity, so local references to it (datastore tables, resource views,
+        links, etc) survive across harvests.
+
+        Resources removed from the remote are simply left out of the returned
+        list, so they get marked as deleted locally; the remaining resources
+        keep their own local ids.
+        '''
+        resources = package_dict.get('resources') or []
+
+        # Map the remote resource id to the local resource id it was saved
+        # with on previous harvests.
+        local_ids_by_remote_id = {}
+        try:
+            existing_package_dict = self._find_existing_package(package_dict)
+        except NotFound:
+            existing_package_dict = None
+
+        if existing_package_dict:
+            for local_resource in existing_package_dict.get('resources', []):
+                local_id = local_resource.get('id')
+                if not local_id:
+                    continue
+                remote_id = local_resource.get(self.remote_resource_id_extra)
+                if not remote_id:
+                    # Resources harvested before this association existed
+                    # were saved using the remote resource id as the local
+                    # one, so that is the fallback mapping.
+                    remote_id = local_id
+                local_ids_by_remote_id.setdefault(remote_id, local_id)
+
+        used_local_ids = set()
+        for resource in resources:
+            # Clear remote url_type for resources (eg datastore, upload) as
+            # we are only creating normal resources with links to the
+            # remote ones
+            resource.pop('url_type', None)
+
+            # Clear revision_id as the revision won't exist on this CKAN
+            # and saving it will cause an IntegrityError with the foreign
+            # key.
+            resource.pop('revision_id', None)
+
+            remote_id = resource.get('id')
+            if not remote_id:
+                # Without a remote id there is nothing to match on, so let
+                # CKAN create a new resource as before.
+                resource.pop('id', None)
+                resource.pop(self.remote_resource_id_extra, None)
+                continue
+
+            local_id = local_ids_by_remote_id.get(remote_id)
+            if not local_id or local_id in used_local_ids:
+                # A resource that doesn't exist locally yet, or a remote id
+                # whose local id was already claimed by another resource.
+                local_id = str(uuid.uuid4())
+            used_local_ids.add(local_id)
+
+            resource['id'] = local_id
+            resource[self.remote_resource_id_extra] = remote_id
+
+        return resources
+
     def import_stage(self, harvest_object):
         log.debug('In CKANHarvester import_stage')
 
@@ -534,16 +615,9 @@ class CKANHarvester(HarvesterBase):
 
                     package_dict['extras'].append({'key': key, 'value': value})
 
-            for resource in package_dict.get('resources', []):
-                # Clear remote url_type for resources (eg datastore, upload) as
-                # we are only creating normal resources with links to the
-                # remote ones
-                resource.pop('url_type', None)
-
-                # Clear revision_id as the revision won't exist on this CKAN
-                # and saving it will cause an IntegrityError with the foreign
-                # key.
-                resource.pop('revision_id', None)
+            if 'resources' in package_dict:
+                package_dict['resources'] = self._assign_local_resource_ids(
+                    package_dict)
 
             package_dict = self.modify_package_dict(package_dict, harvest_object)
 
